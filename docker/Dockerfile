@@ -8,6 +8,20 @@ ENV DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH=${DOCKER_ISAACLAB_EXTENSION_TEMPLATE
 
 USER root
 
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+    libegl1 \
+    libgl1 \
+    libglu1-mesa \
+    libopengl0 \
+    libsm6 \
+    libvulkan1 \
+    libxext6 \
+    libxrender1 \
+    libxt6 && \
+    apt -y autoremove && apt clean autoclean && \
+    rm -rf /var/lib/apt/lists/*
+
 # Copy the Isaac Lab Extension Template directory (files to exclude are defined in .dockerignore)
 COPY ../ ${DOCKER_ISAACLAB_EXTENSION_TEMPLATE_PATH}
 

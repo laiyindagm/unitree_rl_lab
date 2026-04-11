@@ -1,0 +1,14 @@
+{
+	"folders": [
+        {
+            "path": "."
+        },
+        {
+            "path": "../../IsaacLab"
+        },
+        {
+            "path": "../g1_lab"
+        }
+    ],
+	"settings": {}
+}

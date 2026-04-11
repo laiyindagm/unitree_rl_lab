@@ -1,39 +1,22 @@
 #include "FSM/State_RLBase.h"
+#include "KeyboardTeleop.h"
 #include "unitree_articulation.h"
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
-#include <unordered_map>
 
 namespace isaaclab
 {
-// keyboard velocity commands example
-// change "velocity_commands" observation name in policy deploy.yaml to "keyboard_velocity_commands"
-REGISTER_OBSERVATION(keyboard_velocity_commands)
-{
-    std::string key = FSMState::keyboard->key();
-    static auto cfg = env->cfg["commands"]["base_velocity"]["ranges"];
 
-    static std::unordered_map<std::string, std::vector<float>> key_commands = {
-        {"w", {1.0f, 0.0f, 0.0f}},
-        {"s", {-1.0f, 0.0f, 0.0f}},
-        {"a", {0.0f, 1.0f, 0.0f}},
-        {"d", {0.0f, -1.0f, 0.0f}},
-        {"q", {0.0f, 0.0f, 1.0f}},
-        {"e", {0.0f, 0.0f, -1.0f}}
-    };
-    std::vector<float> cmd = {0.0f, 0.0f, 0.0f};
-    if (key_commands.find(key) != key_commands.end())
-    {
-        // TODO: smooth and limit the velocity commands
-        cmd = key_commands[key];
-    }
-    return cmd;
+REGISTER_OBSERVATION(velocity_commands)
+{
+    const auto cmd = g_keyboard_teleop.command();
+    return std::vector<float>{cmd[0], cmd[1], cmd[2]};
 }
 
 }
 
 State_RLBase::State_RLBase(int state_mode, std::string state_string)
-: FSMState(state_mode, state_string) 
+: FSMState(state_mode, state_string)
 {
     auto cfg = param::config["FSM"][state_string];
     auto policy_dir = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
@@ -62,6 +45,13 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
         }
     }
 
+    // Read optional action smoothing alpha from config.yaml
+    // Velocity.action_smoothing: 0.2 (lower = more smoothing, 1.0 = off)
+    if (cfg["action_smoothing"]) {
+        action_smoothing_alpha_ = cfg["action_smoothing"].as<float>();
+        spdlog::info("Action smoothing alpha = {:.3f}", action_smoothing_alpha_);
+    }
+
     this->registered_checks.emplace_back(
         std::make_pair(
             [&]()->bool{ return isaaclab::mdp::bad_orientation(env.get(), 1.0); },
@@ -73,7 +63,21 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 void State_RLBase::run()
 {
     auto action = env->action_manager->processed_actions();
+
+    // EMA smoothing: smoothed = alpha * new + (1 - alpha) * smoothed
+    if (!smoothing_initialized_ || smoothed_actions_.size() != action.size()) {
+        smoothed_actions_ = action;
+        smoothing_initialized_ = true;
+    } else if (action_smoothing_alpha_ < 1.0f) {
+        for (size_t i = 0; i < action.size(); ++i) {
+            smoothed_actions_[i] = action_smoothing_alpha_ * action[i]
+                                 + (1.0f - action_smoothing_alpha_) * smoothed_actions_[i];
+        }
+    } else {
+        smoothed_actions_ = action;
+    }
+
     for (int i = 0; i < static_cast<int>(action_motor_ids_.size()); i++) {
-        lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = action[i];
+        lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = smoothed_actions_[i];
     }
 }

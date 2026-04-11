@@ -1,0 +1,61 @@
+FSM:
+  _:
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    Velocity:
+      id: 3
+      type: RLBase
+
+  Passive:
+    mode: [
+      1,1,1,1,1,1,
+      1,1,1,1,1,1,
+      1,1,1,
+      1,1,1,1,1,1,1,
+      1,1,1,1,1,1,1,
+    ]
+    kd: [
+      3,3,3,3,3,3,
+      3,3,3,3,3,3,
+      3,3,3,
+      3,3,3,3,3,3,3,
+      3,3,3,3,3,3,3,
+    ]
+
+  FixStand:
+    kp: [
+      100., 100., 100., 150., 40., 40.,
+      100., 100., 100., 150., 40., 40.,
+      200,200,200,
+      40,40,40,40,40,40,40,
+      40,40,40,40,40,40,40,
+    ]
+    kd: [
+      2,2,2,4,2,2,
+      2,2,2,4,2,2,
+      5,5,5,
+      10,10,10,10,10,10,10,
+      10,10,10,10,10,10,10,
+    ]
+    ts: [0, 3]
+    qs: [
+      [],
+      [ -0.1, 0,0,0.3,-0.2,0,
+        -0.1, 0,0,0.3,-0.2,0,
+        0,0,0,
+        0, 0.25,0,0.97,0.15, 0,0,
+        0, -0.25,0,0.97,-0.15, 0,0
+      ]
+    ]
+
+  Velocity:
+    # policy_dir: ../g1_29dof/config/policy/velocity
+    policy_dir: /home/hyf/workspace/unitree_rl_lab/logs/rsl_rl/unitree_g1_29dof_velocity/2026-04-05_15-21-34
+    # policy_dir: /home/hyf/workspace/unitree_rl_lab/deploy/robots/g1_29dof_keyboard/policy/
+
+Teleop:
+  lin_vel_x_step: 0.1
+  lin_vel_y_step: 0.05
+  ang_vel_z_step: 0.05
