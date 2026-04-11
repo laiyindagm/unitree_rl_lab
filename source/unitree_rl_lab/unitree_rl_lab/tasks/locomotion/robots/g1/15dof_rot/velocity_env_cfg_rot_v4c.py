@@ -1,0 +1,398 @@
+"""15-DOF rotation config V4c — Flat Terrain Rotation Focus.
+
+V4a baseline + flat terrain + targeted fixes from V3b failure analysis.
+
+Design philosophy: remove terrain complexity to focus learning on rotation,
+apply stronger posture corrections informed by V3b's backward lean issue.
+
+Changes from V4a (marked with ★):
+  ★ Flat terrain only (remove cobblestone, no terrain curriculum)
+  ★ rel_standing_envs: 0.15 → 0.20 (stronger standing foundation for rotation)
+  ★ rel_rotating_envs: 0.05 → 0.10 (double rotation practice)
+  ★ ang_vel_z initial: ±0.2 → ±0.3 (wider start to break curriculum bottleneck)
+  ★ backward_lean: -5.0 → -8.0 (V3b proved -0.5 causes lean; -5.0 still slight)
+  ★ flat_orientation_l2: -8.0 → -10.0 (stronger posture to support backward_lean)
+
+Unchanged from V4a:
+  - All 27 reward terms from V2b (including critical rotation_double_support_slide
+    and rotation_twist_joint that V3b was missing)
+  - NaN safety: obs clipping, clip_actions=100, joint_vel termination
+  - Left-right symmetry augmentation via BasePPORunnerV4Cfg
+  - ang_vel_z limit ±0.6 (conservative, V3a showed wider→high yaw error)
+"""
+
+import math
+
+import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
+from unitree_rl_lab.assets.robots.unitree import UNITREE_G1_29DOF_CFG as ROBOT_CFG
+from unitree_rl_lab.tasks.locomotion import mdp
+
+TRAIN_JOINT_NAMES = [
+    ".*_hip_.*",
+    ".*_knee_joint",
+    ".*_ankle_.*",
+    "waist_.*_joint",
+]
+
+ARM_JOINT_NAMES = [
+    ".*_shoulder_.*",
+    ".*_elbow_joint",
+    ".*_wrist_.*",
+]
+
+ARM_BODY_NAMES = [
+    ".*_shoulder_.*_link",
+    ".*_elbow_link",
+    ".*_wrist_.*_link",
+    ".*_rubber_hand",
+]
+
+# ★ Flat terrain only — remove cobblestone complexity to focus on rotation
+FLAT_TERRAIN_CFG = terrain_gen.TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=9,
+    num_cols=21,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    difficulty_range=(0.0, 1.0),
+    use_cache=False,
+    sub_terrains={"flat": terrain_gen.MeshPlaneTerrainCfg(proportion=1.0)},
+)
+
+
+@configclass
+class RobotSceneCfg(InteractiveSceneCfg):
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=FLAT_TERRAIN_CFG,
+        max_init_terrain_level=FLAT_TERRAIN_CFG.num_rows - 1,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+        ),
+        visual_material=sim_utils.MdlFileCfg(
+            mdl_path=f"{ISAACLAB_NUCLEUS_DIR}/Materials/TilesMarbleSpiderWhiteBrickBondHoned/TilesMarbleSpiderWhiteBrickBondHoned.mdl",
+            project_uvw=True,
+            texture_scale=(0.25, 0.25),
+        ),
+        debug_vis=False,
+    )
+    robot: ArticulationCfg = ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/torso_link",
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0]),
+        debug_vis=False,
+        mesh_prim_paths=["/World/ground"],
+    )
+    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    sky_light = AssetBaseCfg(
+        prim_path="/World/skyLight",
+        spawn=sim_utils.DomeLightCfg(
+            intensity=750.0,
+            texture_file=f"{ISAAC_NUCLEUS_DIR}/Materials/Textures/Skies/PolyHaven/kloofendal_43d_clear_puresky_4k.hdr",
+        ),
+    )
+
+
+@configclass
+class EventCfg:
+    physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+            "static_friction_range": (0.3, 1.0),
+            "dynamic_friction_range": (0.3, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+    add_base_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "mass_distribution_params": (-1.0, 3.0),
+            "operation": "add",
+        },
+    )
+    base_external_force_torque = EventTerm(
+        func=mdp.apply_external_force_torque,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
+            "force_range": (0.0, 0.0),
+            "torque_range": (-0.0, 0.0),
+        },
+    )
+    reset_base = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+                "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+        },
+    )
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_scale,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES),
+            "position_range": (1.0, 1.0),
+            "velocity_range": (-1.0, 1.0),
+        },
+    )
+    reset_arm_joints = EventTerm(
+        func=mdp.reset_joints_by_scale,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=ARM_JOINT_NAMES),
+            "position_range": (1.0, 1.0),
+            "velocity_range": (0.0, 0.0),
+        },
+    )
+    push_robot = EventTerm(
+        func=mdp.push_by_setting_velocity,
+        mode="interval",
+        interval_range_s=(5.0, 5.0),
+        params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
+    )
+
+
+# ---------------------------------------------------------------------------
+# ★ Commands — more standing + more rotation + wider initial yaw
+# ---------------------------------------------------------------------------
+@configclass
+class CommandsCfg:
+    base_velocity = mdp.UniformLevelVelocityCommandCfg(
+        asset_name="robot",
+        resampling_time_range=(10.0, 10.0),
+        rel_standing_envs=0.20,        # ★ 0.15 → 0.20: stronger standing foundation
+        rel_rotating_envs=0.10,        # ★ 0.05 → 0.10: double rotation practice
+        rel_heading_envs=1.0,
+        heading_command=False,
+        debug_vis=True,
+        ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
+            lin_vel_x=(-0.1, 0.1),
+            lin_vel_y=(-0.1, 0.1),
+            ang_vel_z=(-0.3, 0.3),     # ★ ±0.2 → ±0.3: break curriculum bottleneck
+        ),
+        limit_ranges=mdp.UniformLevelVelocityCommandCfg.Ranges(
+            lin_vel_x=(-0.5, 1.5),
+            lin_vel_y=(-0.5, 0.5),
+            ang_vel_z=(-0.6, 0.6),     # keep conservative (V3a showed wide→error)
+        ),
+    )
+
+
+@configclass
+class ActionsCfg:
+    JointPositionAction = mdp.JointPositionActionCfg(
+        asset_name="robot", joint_names=TRAIN_JOINT_NAMES, scale=0.25, use_default_offset=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Observations — V2b layout + NaN safety clipping (same as V4a)
+# ---------------------------------------------------------------------------
+@configclass
+class ObservationsCfg:
+    @configclass
+    class PolicyCfg(ObsGroup):
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, clip=(-5.0, 5.0), noise=Unoise(n_min=-0.2, n_max=0.2))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, clip=(-1.0, 1.0), noise=Unoise(n_min=-0.05, n_max=0.05))
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, clip=(-5.0, 5.0), params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)}, noise=Unoise(n_min=-0.01, n_max=0.01))
+        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, clip=(-5.0, 5.0), params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)}, scale=0.05, noise=Unoise(n_min=-1.5, n_max=1.5))
+        last_action = ObsTerm(func=mdp.last_action, clip=(-5.0, 5.0))
+
+        def __post_init__(self):
+            self.history_length = 5
+            self.enable_corruption = True
+            self.concatenate_terms = True
+
+    policy: PolicyCfg = PolicyCfg()
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, clip=(-5.0, 5.0))
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.2, clip=(-5.0, 5.0))
+        projected_gravity = ObsTerm(func=mdp.projected_gravity, clip=(-1.0, 1.0))
+        velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel, clip=(-5.0, 5.0), params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)})
+        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel, clip=(-5.0, 5.0), params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)}, scale=0.05)
+        last_action = ObsTerm(func=mdp.last_action, clip=(-5.0, 5.0))
+
+        def __post_init__(self):
+            self.history_length = 5
+
+    critic: CriticCfg = CriticCfg()
+
+
+# ---------------------------------------------------------------------------
+# Rewards — V2b 27 terms + ★ stronger posture correction
+# ---------------------------------------------------------------------------
+@configclass
+class RewardsCfg:
+    # --- Core tracking ---
+    track_lin_vel_xy = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=1.0, params={"command_name": "base_velocity", "std": math.sqrt(0.25)})
+    alive = RewTerm(func=mdp.is_alive, weight=0.15)
+
+    # --- Base stability ---
+    base_linear_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
+    base_angular_velocity = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+
+    # --- Aggressive smoothness penalties (reward-driven, no LCP) ---
+    joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=-0.003, params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)})
+    joint_acc = RewTerm(func=mdp.joint_acc_l2, weight=-1e-6, params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)})
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.2)
+
+    # --- Joint constraints ---
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-5.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)})
+    energy = RewTerm(func=mdp.energy, weight=-2e-5, params={"asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)})
+    joint_deviation_waists = RewTerm(func=mdp.joint_deviation_l1, weight=-1, params={"asset_cfg": SceneEntityCfg("robot", joint_names=["waist.*"])})
+    joint_deviation_legs = RewTerm(func=mdp.joint_deviation_l1, weight=-1.0, params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_hip_roll_joint", ".*_hip_yaw_joint"])})
+
+    # --- ★ Stronger posture correction ---
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-10.0)   # ★ -8.0 → -10.0
+    base_height = RewTerm(func=mdp.base_height_l2, weight=-10, params={"target_height": 0.74})
+    backward_lean = RewTerm(func=mdp.backward_lean_penalty, weight=-8.0)        # ★ -5.0 → -8.0
+
+    # --- Shorter/quicker gait ---
+    gait = RewTerm(func=mdp.feet_gait, weight=0.5, params={"period": 0.6, "offset": [0.0, 0.5], "threshold": 0.55, "command_name": "base_velocity", "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*")})
+    feet_slide = RewTerm(func=mdp.feet_slide, weight=-0.2, params={"asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"), "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*")})
+    feet_clearance = RewTerm(func=mdp.foot_clearance_reward, weight=1.0, params={"std": 0.05, "tanh_mult": 2.0, "target_height": 0.08, "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
+    undesired_contacts = RewTerm(func=mdp.undesired_contacts, weight=-1, params={"threshold": 1, "sensor_cfg": SceneEntityCfg("contact_forces", body_names=["(?!.*ankle.*)(?!.*shoulder.*)(?!.*elbow.*)(?!.*wrist.*)(?!.*rubber_hand).*"])})
+    feet_too_near = RewTerm(func=mdp.feet_too_near, weight=-0.5, params={"threshold": 0.18, "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*")})
+
+    # --- Strong standing behavior ---
+    stand_still = RewTerm(func=mdp.stand_still, weight=-1.0, params={"command_name": "base_velocity"})
+    feet_contact_without_cmd = RewTerm(func=mdp.feet_contact_without_cmd, weight=1.0, params={"command_name": "base_velocity", "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*")})
+
+    # --- Rotation tracking (same as V2b) ---
+    track_ang_vel_z = RewTerm(
+        func=mdp.track_ang_vel_z_rotating_aware,
+        weight=0.6,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
+    yaw_rate_l1 = RewTerm(
+        func=mdp.yaw_rate_l1,
+        weight=-0.1,
+        params={"command_name": "base_velocity"},
+    )
+
+    # --- Rotation shaping (critical — V3b failed WITHOUT these) ---
+    rotation_single_support = RewTerm(
+        func=mdp.rotation_single_support_reward,
+        weight=0.3,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+        },
+    )
+    rotation_double_support_slide = RewTerm(
+        func=mdp.rotation_double_support_slide_penalty,
+        weight=-0.5,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*ankle_roll.*"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+        },
+    )
+    rotation_twist_joint = RewTerm(
+        func=mdp.rotation_twist_joint_penalty,
+        weight=-0.05,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["waist_yaw_joint", ".*_hip_yaw_joint"]),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Terminations — NaN safety (same as V4a)
+# ---------------------------------------------------------------------------
+@configclass
+class TerminationsCfg:
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    base_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.2})
+    bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 0.8})
+    joint_vel_limit = DoneTerm(
+        func=mdp.joint_vel_out_of_manual_limit,
+        params={"max_velocity": 100.0, "asset_cfg": SceneEntityCfg("robot", joint_names=TRAIN_JOINT_NAMES)},
+    )
+
+
+# ★ No terrain curriculum — flat terrain only, velocity curriculum still active
+@configclass
+class CurriculumCfg:
+    lin_vel_cmd_levels = CurrTerm(mdp.lin_vel_cmd_levels)
+    ang_vel_cmd_levels = CurrTerm(mdp.ang_vel_cmd_levels)
+
+
+@configclass
+class RobotEnvCfg(ManagerBasedRLEnvCfg):
+    scene: RobotSceneCfg = RobotSceneCfg(num_envs=4096, env_spacing=2.5)
+    observations: ObservationsCfg = ObservationsCfg()
+    actions: ActionsCfg = ActionsCfg()
+    commands: CommandsCfg = CommandsCfg()
+    rewards: RewardsCfg = RewardsCfg()
+    terminations: TerminationsCfg = TerminationsCfg()
+    events: EventCfg = EventCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
+
+    def __post_init__(self):
+        self.decimation = 4
+        self.episode_length_s = 20.0
+        self.sim.dt = 0.005
+        self.sim.render_interval = self.decimation
+        self.sim.physics_material = self.scene.terrain.physics_material
+        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        self.scene.contact_forces.update_period = self.sim.dt
+        self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+        # ★ No terrain curriculum (flat terrain)
+        if self.scene.terrain.terrain_generator is not None:
+            self.scene.terrain.terrain_generator.curriculum = False
+
+
+@configclass
+class RobotPlayEnvCfg(RobotEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.scene.terrain.terrain_generator.num_rows = 2
+        self.scene.terrain.terrain_generator.num_cols = 10
+        self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
