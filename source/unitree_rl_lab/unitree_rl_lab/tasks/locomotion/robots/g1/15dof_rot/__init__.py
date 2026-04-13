@@ -252,3 +252,139 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
     },
 )
+
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V5c-TransformerAux",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v5c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v5c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofTransformerAuxPPORunnerCfg",
+    },
+)
+
+# ---------------------------------------------------------------------------
+# V9 — Three orthogonal directions
+# V9a: Gait Signal Fix  (observation layer)
+# V9b: Action Penalty Reshaping  (reward layer)
+# V9c: Speed-Bucketed Curriculum  (curriculum layer)
+# ---------------------------------------------------------------------------
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V9a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V9b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V9c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v9c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V10 — Bucketed Curriculum Bug Fix + Stronger Waist + Variants
+# V10a: Fixed snapshot bucketed curriculum + waist(-0.08)
+# V10b: V10a + aligned gait clock (walk_period=0.7)
+# V10c: Manual iteration-based schedule (deterministic failsafe)
+# ---------------------------------------------------------------------------
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V10a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V10b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V10c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V10d: Fixed bucketed curriculum + per-joint waist differentiation
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V10d",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v10d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V11a: Adaptive sigma tracking (fix dead zone from reward side)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V11a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V11b: Scaled action rate (fix dead zone from penalty side)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V11b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V11c: Adaptive sigma + scaled action rate (fix dead zone from both sides)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V11c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)

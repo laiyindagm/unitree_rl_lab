@@ -59,3 +59,164 @@ def ang_vel_cmd_levels(
             ).tolist()
 
     return torch.tensor(ranges.ang_vel_z[1], device=env.device)
+
+
+def terrain_levels_vel(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    asset_cfg=None,
+) -> torch.Tensor:
+    """Terrain level curriculum based on velocity tracking."""
+    return torch.mean(env.scene.terrain.terrain_levels.float())
+
+
+def speed_bucketed_vel_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    reward_term_name: str = "track_lin_vel_xy",
+    low_speed_threshold: float = 0.3,
+    mid_speed_threshold: float = 0.6,
+    unlock_reward_ratio: float = 0.6,
+) -> torch.Tensor:
+    """Speed-bucketed velocity curriculum.
+
+    Accumulates per-env reward data from each _reset_idx call into a buffer.
+    At periodic checkpoints (same gate as lin_vel_cmd_levels), evaluates the
+    buffered data and decides whether to advance the bucket level.
+
+    Compatible with init_at_random_ep_len=True where envs reset at different
+    times (only ~4 envs per step). The buffer collects data across steps,
+    ensuring enough samples for a reliable evaluation.
+
+    Buckets:
+      0: standstill/very low (cmd < low_speed_threshold) -- always active
+      1: low speed (low_speed_threshold..mid_speed_threshold)
+      2: mid speed (mid_speed_threshold..limit)
+    """
+    command_term = env.command_manager.get_term("base_velocity")
+    ranges = command_term.cfg.ranges
+    limit_ranges = command_term.cfg.limit_ranges
+
+    # Initialize state on first call
+    if not hasattr(env, "_current_bucket_level"):
+        env._current_bucket_level = 0
+        env._bucket_reward_buf = []  # list of (avg_reward, cmd_lin_norm) tuples
+        env._bucket_last_eval_step = 0
+
+    reward_term = env.reward_manager.get_term_cfg(reward_term_name)
+
+    # Accumulate data from every reset batch (even between gate evaluations)
+    if len(env_ids) > 0:
+        episode_rewards = env.reward_manager._episode_sums[reward_term_name][env_ids]
+        avg_reward = episode_rewards / env.max_episode_length_s
+        cmd = env.command_manager.get_command("base_velocity")[env_ids]
+        cmd_lin_norm = torch.norm(cmd[:, :2], dim=1)
+        env._bucket_reward_buf.append((avg_reward.detach().clone(), cmd_lin_norm.detach().clone()))
+
+    # Evaluate at episode boundaries (same gate as lin_vel_cmd_levels)
+    if env.common_step_counter % env.max_episode_length != 0:
+        return torch.tensor(env._current_bucket_level, device=env.device, dtype=torch.float32)
+
+    # Gate passed -- evaluate buffered data
+    target = reward_term.weight * unlock_reward_ratio
+
+    if len(env._bucket_reward_buf) > 0:
+        all_avg_reward = torch.cat([x[0] for x in env._bucket_reward_buf])
+        all_cmd_norm = torch.cat([x[1] for x in env._bucket_reward_buf])
+
+        if env._current_bucket_level == 0:
+            bucket_0_mask = all_cmd_norm < low_speed_threshold
+            if bucket_0_mask.sum() > 0:
+                avg_bucket_0 = all_avg_reward[bucket_0_mask].mean()
+                if avg_bucket_0 > target:
+                    env._current_bucket_level = 1
+                    ranges.lin_vel_x = [-low_speed_threshold, mid_speed_threshold]
+                    ranges.lin_vel_y = [-low_speed_threshold, low_speed_threshold]
+
+        elif env._current_bucket_level == 1:
+            bucket_1_mask = (all_cmd_norm >= low_speed_threshold) & (all_cmd_norm < mid_speed_threshold)
+            if bucket_1_mask.sum() > 0:
+                avg_bucket_1 = all_avg_reward[bucket_1_mask].mean()
+                if avg_bucket_1 > target:
+                    env._current_bucket_level = 2
+                    ranges.lin_vel_x = list(limit_ranges.lin_vel_x)
+                    ranges.lin_vel_y = list(limit_ranges.lin_vel_y)
+
+        # Also handle ang_vel progression tied to bucket level
+        if env._current_bucket_level >= 1:
+            current_ang = ranges.ang_vel_z
+            if isinstance(current_ang, (list, tuple)):
+                current_max = current_ang[1]
+            else:
+                current_max = float(current_ang)
+            limit_max = limit_ranges.ang_vel_z[1]
+            if current_max < limit_max:
+                new_max = min(current_max + 0.1, limit_max)
+                ranges.ang_vel_z = [-new_max, new_max]
+
+    # Clear buffer after evaluation
+    env._bucket_reward_buf = []
+
+    return torch.tensor(env._current_bucket_level, device=env.device, dtype=torch.float32)
+
+
+def iteration_based_vel_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    expand_iterations: tuple[int, ...] = (2000, 5000, 8000),
+) -> torch.Tensor:
+    """Iteration-based velocity curriculum -- deterministic schedule.
+
+    Expands velocity command ranges at fixed iteration counts, independent
+    of reward performance. Most robust fallback when reward-based curricula
+    are unreliable.
+
+    Schedule:
+      Before expand_iterations[0]: initial ranges (from config)
+      After expand_iterations[0]:  30% of way to limit
+      After expand_iterations[1]:  65% of way to limit
+      After expand_iterations[2]:  full limit_ranges
+    """
+    command_term = env.command_manager.get_term("base_velocity")
+    ranges = command_term.cfg.ranges
+    limit_ranges = command_term.cfg.limit_ranges
+
+    if not hasattr(env, "_iter_curriculum_level"):
+        env._iter_curriculum_level = 0
+        env._iter_initial_lin_vel_x = list(ranges.lin_vel_x)
+        env._iter_initial_lin_vel_y = list(ranges.lin_vel_y)
+        env._iter_initial_ang_vel_z = list(ranges.ang_vel_z)
+
+    # steps_per_iter = num_steps_per_env from PPO config (typically 24)
+    # common_step_counter = total RL steps (not iterations)
+    # With 24 steps per iteration: iteration ~ common_step_counter / 24
+    steps_per_iter = 24  # RSL_RL default num_steps_per_env
+    current_iter = env.common_step_counter // steps_per_iter
+
+    def _lerp_range(initial, limit, alpha):
+        return [
+            initial[0] + alpha * (limit[0] - initial[0]),
+            initial[1] + alpha * (limit[1] - initial[1]),
+        ]
+
+    new_level = 0
+    for i, threshold in enumerate(expand_iterations):
+        if current_iter >= threshold:
+            new_level = i + 1
+
+    if new_level > env._iter_curriculum_level:
+        env._iter_curriculum_level = new_level
+        alphas = [0.0, 0.3, 0.65, 1.0]
+        alpha = alphas[min(new_level, len(alphas) - 1)]
+
+        ranges.lin_vel_x = _lerp_range(
+            env._iter_initial_lin_vel_x, list(limit_ranges.lin_vel_x), alpha
+        )
+        ranges.lin_vel_y = _lerp_range(
+            env._iter_initial_lin_vel_y, list(limit_ranges.lin_vel_y), alpha
+        )
+        ranges.ang_vel_z = _lerp_range(
+            env._iter_initial_ang_vel_z, list(limit_ranges.ang_vel_z), alpha
+        )
+
+    return torch.tensor(env._iter_curriculum_level, device=env.device, dtype=torch.float32)

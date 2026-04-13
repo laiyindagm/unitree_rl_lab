@@ -20,30 +20,12 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 {
     auto cfg = param::config["FSM"][state_string];
     auto policy_dir = param::parser_policy_dir(cfg["policy_dir"].as<std::string>());
-    auto deploy_cfg = YAML::LoadFile(policy_dir / "params" / "deploy.yaml");
 
     env = std::make_unique<isaaclab::ManagerBasedRLEnv>(
-        deploy_cfg,
+        YAML::LoadFile(policy_dir / "params" / "deploy.yaml"),
         std::make_shared<unitree::BaseArticulation<LowState_t::SharedPtr>>(FSMState::lowstate)
     );
     env->alg = std::make_unique<isaaclab::OrtRunner>(policy_dir / "exported" / "policy.onnx");
-
-    // Build action-to-motor mapping
-    const auto& joint_ids_map = env->robot->data.joint_ids_map;
-    auto action_cfg = deploy_cfg["actions"];
-    for (auto it = action_cfg.begin(); it != action_cfg.end(); ++it) {
-        auto term_cfg = it->second;
-        if (!term_cfg["joint_ids"].IsNull()) {
-            auto joint_ids = term_cfg["joint_ids"].as<std::vector<int>>();
-            for (int id : joint_ids) {
-                action_motor_ids_.push_back(static_cast<int>(joint_ids_map[id]));
-            }
-        } else {
-            for (int i = 0; i < static_cast<int>(joint_ids_map.size()); i++) {
-                action_motor_ids_.push_back(static_cast<int>(joint_ids_map[i]));
-            }
-        }
-    }
 
     this->registered_checks.emplace_back(
         std::make_pair(
@@ -56,7 +38,7 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 void State_RLBase::run()
 {
     auto action = env->action_manager->processed_actions();
-    for (int i = 0; i < static_cast<int>(action_motor_ids_.size()); i++) {
-        lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = action[i];
+    for (int i = 0; i < env->robot->data.joint_ids_map.size(); i++) {
+        lowcmd->msg_.motor_cmd()[env->robot->data.joint_ids_map[i]].q() = action[i];
     }
 }

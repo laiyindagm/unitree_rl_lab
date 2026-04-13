@@ -23,10 +23,6 @@ public:
             lowcmd->msg_.motor_cmd()[i].tau() = 0;
         }
 
-        // Reset action smoothing state
-        smoothed_actions_.clear();
-        smoothing_initialized_ = false;
-
         env->robot->update();
         // Start policy thread
         policy_thread_running = true;
@@ -67,12 +63,6 @@ protected:
     // For 29dof: action_motor_ids_[i] = joint_ids_map[i] (all joints)
     // For 15dof: action_motor_ids_[i] = joint_ids_map[action_joint_ids[i]] (subset)
     std::vector<int> action_motor_ids_;
-
-    // Action smoothing (EMA) for sim2sim robustness.
-    // alpha = 1.0 means no smoothing; lower values = more smoothing.
-    float action_smoothing_alpha_ = 1.0f;
-    std::vector<float> smoothed_actions_;
-    bool smoothing_initialized_ = false;
 
 private:
     std::thread policy_thread;
