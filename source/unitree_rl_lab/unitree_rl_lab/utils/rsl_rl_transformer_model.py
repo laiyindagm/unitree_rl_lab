@@ -10,8 +10,27 @@ from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import HiddenState
 
 
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation: z = gamma * h + beta."""
+
+    def __init__(self, cond_dim: int, feat_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(cond_dim, feat_dim * 2)
+
+    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gb = self.proj(cond)
+        gamma, beta = gb.chunk(2, dim=-1)
+        return (1.0 + gamma) * h + beta
+
+
 class TransformerHistoryModel(MLPModel):
-    """Transformer model that fuses stacked history with current state."""
+    """Transformer model that fuses stacked history with current state.
+
+    Improvements over the original version:
+    - Causal mask in the TransformerEncoder (time-step t cannot attend to t+1).
+    - FiLM conditioning replaces the degenerate single-token cross-attention.
+    - Optional next-observation prediction head for auxiliary self-supervised loss.
+    """
 
     is_recurrent: bool = False
 
@@ -34,6 +53,7 @@ class TransformerHistoryModel(MLPModel):
         n_heads: int = 4,
         encoder_num_layers: int = 2,
         encoder_dim_feedforward: int = 512,
+        enable_aux_loss: bool = False,
     ) -> None:
         self.latent_dim = d_model
         self.history_len = history_len
@@ -71,9 +91,15 @@ class TransformerHistoryModel(MLPModel):
 
         self._validate_slices(self.obs_dim)
 
+        # --- Transformer encoder ---
         self.hist_proj = nn.Linear(self.history_obs_dim, d_model)
-        self.aux_proj = nn.Linear(self.aux_obs_dim, d_model)
         self.pos_emb = nn.Parameter(torch.randn(1, self.history_len, d_model) * 0.1)
+
+        # Causal mask: prevents time-step t from attending to future steps.
+        causal_mask = torch.triu(
+            torch.ones(self.history_len, self.history_len, dtype=torch.bool), diagonal=1
+        )
+        self.register_buffer("causal_mask", causal_mask)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -84,8 +110,19 @@ class TransformerHistoryModel(MLPModel):
         )
         self.hist_encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_num_layers)
 
-        self.cross_attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=n_heads, batch_first=True)
+        # --- FiLM conditioning (replaces cross-attention) ---
+        self.aux_proj = nn.Linear(self.aux_obs_dim, d_model)
+        self.film = FiLMLayer(cond_dim=d_model, feat_dim=d_model)
         self.ln_fusion = nn.LayerNorm(d_model)
+
+        # --- Optional next-obs prediction head ---
+        self.enable_aux_loss = enable_aux_loss
+        if enable_aux_loss:
+            self.next_obs_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ELU(),
+                nn.Linear(d_model, self.history_obs_dim),
+            )
 
     def _validate_slices(self, obs_dim: int) -> None:
         history_end = self.history_start_idx + self.history_total_dim
@@ -106,13 +143,11 @@ class TransformerHistoryModel(MLPModel):
 
     def _encode_history_and_aux(self, history: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
         h_emb = self.hist_proj(history) + self.pos_emb
-        h_encoded = self.hist_encoder(h_emb)
+        h_encoded = self.hist_encoder(h_emb, mask=self.causal_mask)
 
-        curr_state_query = h_encoded[:, -1:, :]
-        aux_emb = self.aux_proj(aux).unsqueeze(1)
-        context, _ = self.cross_attn(curr_state_query, aux_emb, aux_emb, need_weights=False)
-
-        fused_state = self.ln_fusion(curr_state_query + context).squeeze(1)
+        last_token = h_encoded[:, -1, :]  # (B, d_model)
+        aux_emb = self.aux_proj(aux)  # (B, d_model)
+        fused_state = self.ln_fusion(self.film(last_token, aux_emb))
         return fused_state
 
     def get_latent(
@@ -124,6 +159,23 @@ class TransformerHistoryModel(MLPModel):
 
         history, aux = self._split_from_flat(flat_obs)
         return self._encode_history_and_aux(history, aux)
+
+    def predict_next_obs(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (latent, predicted_next_obs_frame).
+
+        Only meaningful when ``enable_aux_loss=True``; raises otherwise.
+        """
+        if not self.enable_aux_loss:
+            raise RuntimeError("predict_next_obs requires enable_aux_loss=True")
+
+        obs_list = [obs[obs_group] for obs_group in self.obs_groups]
+        flat_obs = torch.cat(obs_list, dim=-1)
+        flat_obs = self.obs_normalizer(flat_obs)
+
+        history, aux = self._split_from_flat(flat_obs)
+        latent = self._encode_history_and_aux(history, aux)
+        predicted = self.next_obs_head(latent)
+        return latent, predicted
 
     def as_jit(self) -> nn.Module:
         return _TorchTransformerHistoryModel(self)
@@ -150,10 +202,11 @@ class _TorchTransformerHistoryModel(nn.Module):
         self.aux_obs_dim = model.aux_obs_dim
 
         self.hist_proj = copy.deepcopy(model.hist_proj)
-        self.aux_proj = copy.deepcopy(model.aux_proj)
         self.pos_emb = copy.deepcopy(model.pos_emb)
+        self.register_buffer("causal_mask", model.causal_mask.clone())
         self.hist_encoder = copy.deepcopy(model.hist_encoder)
-        self.cross_attn = copy.deepcopy(model.cross_attn)
+        self.aux_proj = copy.deepcopy(model.aux_proj)
+        self.film = copy.deepcopy(model.film)
         self.ln_fusion = copy.deepcopy(model.ln_fusion)
         self.mlp = copy.deepcopy(model.mlp)
 
@@ -170,13 +223,11 @@ class _TorchTransformerHistoryModel(nn.Module):
 
     def _encode_history_and_aux(self, history: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
         h_emb = self.hist_proj(history) + self.pos_emb
-        h_encoded = self.hist_encoder(h_emb)
+        h_encoded = self.hist_encoder(h_emb, mask=self.causal_mask)
 
-        curr_state_query = h_encoded[:, -1:, :]
-        aux_emb = self.aux_proj(aux).unsqueeze(1)
-        context, _ = self.cross_attn(curr_state_query, aux_emb, aux_emb, need_weights=False)
-
-        fused_state = self.ln_fusion(curr_state_query + context).squeeze(1)
+        last_token = h_encoded[:, -1, :]
+        aux_emb = self.aux_proj(aux)
+        fused_state = self.ln_fusion(self.film(last_token, aux_emb))
         return fused_state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -210,10 +261,11 @@ class _OnnxTransformerHistoryModel(nn.Module):
         self.aux_obs_dim = model.aux_obs_dim
 
         self.hist_proj = copy.deepcopy(model.hist_proj)
-        self.aux_proj = copy.deepcopy(model.aux_proj)
         self.pos_emb = copy.deepcopy(model.pos_emb)
+        self.register_buffer("causal_mask", model.causal_mask.clone())
         self.hist_encoder = copy.deepcopy(model.hist_encoder)
-        self.cross_attn = copy.deepcopy(model.cross_attn)
+        self.aux_proj = copy.deepcopy(model.aux_proj)
+        self.film = copy.deepcopy(model.film)
         self.ln_fusion = copy.deepcopy(model.ln_fusion)
         self.mlp = copy.deepcopy(model.mlp)
 
@@ -232,13 +284,11 @@ class _OnnxTransformerHistoryModel(nn.Module):
 
     def _encode_history_and_aux(self, history: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
         h_emb = self.hist_proj(history) + self.pos_emb
-        h_encoded = self.hist_encoder(h_emb)
+        h_encoded = self.hist_encoder(h_emb, mask=self.causal_mask)
 
-        curr_state_query = h_encoded[:, -1:, :]
-        aux_emb = self.aux_proj(aux).unsqueeze(1)
-        context, _ = self.cross_attn(curr_state_query, aux_emb, aux_emb, need_weights=False)
-
-        fused_state = self.ln_fusion(curr_state_query + context).squeeze(1)
+        last_token = h_encoded[:, -1, :]
+        aux_emb = self.aux_proj(aux)
+        fused_state = self.ln_fusion(self.film(last_token, aux_emb))
         return fused_state
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

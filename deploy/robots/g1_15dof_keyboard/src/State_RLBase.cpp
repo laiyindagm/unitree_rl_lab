@@ -4,6 +4,8 @@
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 
+#include <cmath>
+
 namespace isaaclab
 {
 
@@ -11,6 +13,47 @@ REGISTER_OBSERVATION(velocity_commands)
 {
     const auto cmd = g_keyboard_teleop.command();
     return std::vector<float>{cmd[0], cmd[1], cmd[2]};
+}
+
+// Override gait_phase to support speed-adaptive mode (V9a).
+// Detects walk_period in params -> speed-adaptive; otherwise falls back to
+// fixed-period mode (original behaviour).
+REGISTER_OBSERVATION(gait_phase)
+{
+    // Speed-adaptive mode: walk_period present in params
+    if (params["walk_period"] && !params["walk_period"].IsNull()) {
+        const float walk_period  = params["walk_period"].as<float>();
+        const float run_period   = params["run_period"].as<float>(0.7f);
+        const float speed_thresh = params["speed_threshold"].as<float>(0.8f);
+        const float decay_factor = params["decay_factor"].as<float>(0.95f);
+        const float still_thresh = params["standstill_threshold"].as<float>(0.1f);
+
+        // Get commanded velocity from keyboard
+        const auto cmd = g_keyboard_teleop.command();
+        const float speed = std::sqrt(cmd[0] * cmd[0] + cmd[1] * cmd[1]);
+
+        if (speed < still_thresh) {
+            // Standstill: decay phase toward 0 -> "stop stepping" signal
+            env->global_phase *= decay_factor;
+        } else {
+            // Speed-dependent period: slow walk -> walk_period, fast -> run_period
+            const float alpha = std::min(speed / speed_thresh, 1.0f);
+            const float period = walk_period - (walk_period - run_period) * alpha;
+            env->global_phase += env->step_dt / period;
+        }
+        env->global_phase = std::fmod(env->global_phase, 1.0f);
+    } else {
+        // Fixed-period mode (backward compatible)
+        const float period = params["period"].as<float>();
+        env->global_phase += env->step_dt / period;
+        env->global_phase = std::fmod(env->global_phase, 1.0f);
+    }
+
+    const float two_pi = 2.0f * static_cast<float>(M_PI);
+    std::vector<float> obs(2);
+    obs[0] = std::sin(env->global_phase * two_pi);
+    obs[1] = std::cos(env->global_phase * two_pi);
+    return obs;
 }
 
 }
@@ -45,13 +88,6 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
         }
     }
 
-    // Read optional action smoothing alpha from config.yaml
-    // Velocity.action_smoothing: 0.2 (lower = more smoothing, 1.0 = off)
-    if (cfg["action_smoothing"]) {
-        action_smoothing_alpha_ = cfg["action_smoothing"].as<float>();
-        spdlog::info("Action smoothing alpha = {:.3f}", action_smoothing_alpha_);
-    }
-
     this->registered_checks.emplace_back(
         std::make_pair(
             [&]()->bool{ return isaaclab::mdp::bad_orientation(env.get(), 1.0); },
@@ -63,21 +99,7 @@ State_RLBase::State_RLBase(int state_mode, std::string state_string)
 void State_RLBase::run()
 {
     auto action = env->action_manager->processed_actions();
-
-    // EMA smoothing: smoothed = alpha * new + (1 - alpha) * smoothed
-    if (!smoothing_initialized_ || smoothed_actions_.size() != action.size()) {
-        smoothed_actions_ = action;
-        smoothing_initialized_ = true;
-    } else if (action_smoothing_alpha_ < 1.0f) {
-        for (size_t i = 0; i < action.size(); ++i) {
-            smoothed_actions_[i] = action_smoothing_alpha_ * action[i]
-                                 + (1.0f - action_smoothing_alpha_) * smoothed_actions_[i];
-        }
-    } else {
-        smoothed_actions_ = action;
-    }
-
     for (int i = 0; i < static_cast<int>(action_motor_ids_.size()); i++) {
-        lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = smoothed_actions_[i];
+        lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = action[i];
     }
 }

@@ -273,3 +273,77 @@ class G115DofLCPPPORunnerV3dCfg(G115DofLCPPPORunnerCfg):
             data_augmentation_func=symmetry_g1_15dof.compute_symmetric_states,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Transformer actor + MLP critic with auxiliary next-obs prediction loss
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class RslRlTransformerAuxPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """PPO algorithm config with auxiliary prediction loss settings."""
+
+    aux_loss_coef: float = 0.5
+    aux_loss_schedule: list[float] | None = None  # [start, end, decay_start, decay_steps]
+
+
+@configclass
+class RslRlTransformerAuxModelCfg(RslRlTransformerModelCfg):
+    """Transformer model config with auxiliary prediction enabled."""
+
+    enable_aux_loss: bool = True
+
+
+@configclass
+class G115DofTransformerAuxPPORunnerCfg(BasePPORunnerCfg):
+    """Transformer actor (with aux prediction) + MLP critic for 15-DOF.
+
+    Improvements over G115DofTransformerPPORunnerCfg:
+    - Causal mask in Transformer encoder.
+    - FiLM conditioning instead of degenerate cross-attention.
+    - Next-obs prediction auxiliary loss with linear decay schedule.
+    - Critic stays as MLP (no Transformer overhead for value estimation).
+    """
+
+    clip_actions = 100.0
+
+    actor = RslRlTransformerAuxModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.5),
+        history_len=5,
+        history_start_idx=0,
+        history_obs_dim=54,
+        aux_start_idx=216,
+        aux_obs_dim=54,
+        d_model=256,
+        n_heads=4,
+        encoder_num_layers=2,
+        encoder_dim_feedforward=512,
+        enable_aux_loss=True,
+    )
+
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=None,
+    )
+
+    algorithm = RslRlTransformerAuxPpoAlgorithmCfg(
+        class_name="unitree_rl_lab.utils.transformer_ppo:TransformerPPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.5,
+        aux_loss_schedule=[0.5, 0.05, 0, 5000],
+    )
