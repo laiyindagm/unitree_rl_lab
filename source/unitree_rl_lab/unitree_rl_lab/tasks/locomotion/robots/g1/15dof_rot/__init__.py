@@ -388,3 +388,63 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
     },
 )
+
+# V11d: Low-speed tracking bonus (fix dead zone from reward side, safe additive)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V11d",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V11e: V11b + low-speed bonus (combined penalty + reward fix)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V11e",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11e:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v11e:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V12a: Scheduled sigma annealing (fix dead zone from reward side, safe global annealing)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V12a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V12b: Scheduled sigma + scaled action rate (fix dead zone from both sides)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V12b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V12c: Scheduled sigma + scaled action rate + low-speed bonus (triple attack)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V12c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v12c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
