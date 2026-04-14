@@ -493,3 +493,141 @@ def track_ang_vel_z_adaptive_sigma(
         cmd_yaw.abs() < straight_walk_yaw_threshold
     )
     return torch.where(is_straight_walk, torch.ones_like(tracking), tracking)
+
+
+def low_speed_tracking_bonus(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    speed_threshold: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Bonus reward for accurately tracking linear velocity at low command speeds.
+
+    Returns linear accuracy: 1.0 at perfect tracking, 0.0 when error >= |cmd|.
+    Only active when 0.05 < cmd_lin_norm < speed_threshold.
+
+    Key property: standing still at cmd=0.2 gives accuracy=0 (no "free" reward),
+    so this does NOT interfere with early stability training unlike adaptive sigma.
+    Purely ADDITIVE: increases marginal gain of tracking at low speed.
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+
+    cmd_norm = torch.norm(cmd, dim=1)
+    error = torch.norm(cmd - vel, dim=1)
+
+    mask = (cmd_norm > 0.05) & (cmd_norm < speed_threshold)
+    accuracy = torch.clamp(1.0 - error / cmd_norm.clamp(min=0.05), min=0.0)
+
+    return accuracy * mask.float()
+
+
+def low_speed_rotation_bonus(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    ang_threshold: float = 0.5,
+) -> torch.Tensor:
+    """Bonus reward for accurately tracking angular velocity at low command speeds.
+
+    Same linear accuracy as low_speed_tracking_bonus but for yaw rotation.
+    Only active when 0.05 < |cmd_yaw| < ang_threshold.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    cmd_yaw_abs = cmd_yaw.abs()
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    error = (actual_yaw - cmd_yaw).abs()
+
+    mask = (cmd_yaw_abs > 0.05) & (cmd_yaw_abs < ang_threshold)
+    accuracy = torch.clamp(1.0 - error / cmd_yaw_abs.clamp(min=0.05), min=0.0)
+
+    return accuracy * mask.float()
+
+
+# ---------------------------------------------------------------------------
+# V12: Scheduled sigma tracking -- global σ annealing over training iterations
+# ---------------------------------------------------------------------------
+
+
+def track_lin_vel_xy_scheduled_sigma(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sigma_start: float = 0.5,
+    sigma_end: float = 0.3,
+    anneal_start_iter: int = 3000,
+    anneal_end_iter: int = 8000,
+    steps_per_iter: int = 24,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track linear velocity with globally scheduled sigma annealing.
+
+    Unlike adaptive sigma (V11a) which varies σ per-sample by |cmd| and
+    poisons early training, this anneals σ uniformly across ALL samples
+    based on training iteration. Phase 1 (σ=σ_start) is identical to the
+    proven V6c/V10d baseline, so early training is completely unaffected.
+
+    Schedule:
+      iter < anneal_start_iter:  σ = sigma_start  (standard training)
+      anneal_start..anneal_end:  σ linearly decreases
+      iter >= anneal_end_iter:   σ = sigma_end    (tighter tracking)
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+
+    current_iter = env.common_step_counter // steps_per_iter
+    if current_iter <= anneal_start_iter:
+        sigma = sigma_start
+    elif current_iter >= anneal_end_iter:
+        sigma = sigma_end
+    else:
+        alpha = (current_iter - anneal_start_iter) / (anneal_end_iter - anneal_start_iter)
+        sigma = sigma_start + alpha * (sigma_end - sigma_start)
+
+    lin_vel_error = torch.sum(torch.square(cmd - vel), dim=1)
+    return torch.exp(-lin_vel_error / (sigma ** 2))
+
+
+def track_ang_vel_z_scheduled_sigma(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sigma_start: float = 0.5,
+    sigma_end: float = 0.25,
+    anneal_start_iter: int = 3000,
+    anneal_end_iter: int = 8000,
+    steps_per_iter: int = 24,
+    straight_walk_lin_threshold: float = 0.1,
+    straight_walk_yaw_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Track angular velocity with globally scheduled sigma annealing.
+
+    Same straight-walk bypass as track_ang_vel_z_rotating_aware.
+    sigma_end defaults to 0.25 (tighter than lin_vel's 0.3) because
+    rotation requires more precise tracking to overcome the dead zone.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_lin_norm = torch.norm(cmd[:, :2], dim=1)
+    cmd_yaw = cmd[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    yaw_error = (actual_yaw - cmd_yaw).square()
+
+    current_iter = env.common_step_counter // steps_per_iter
+    if current_iter <= anneal_start_iter:
+        sigma = sigma_start
+    elif current_iter >= anneal_end_iter:
+        sigma = sigma_end
+    else:
+        alpha = (current_iter - anneal_start_iter) / (anneal_end_iter - anneal_start_iter)
+        sigma = sigma_start + alpha * (sigma_end - sigma_start)
+
+    tracking = torch.exp(-yaw_error / (sigma ** 2))
+
+    is_straight_walk = (cmd_lin_norm > straight_walk_lin_threshold) & (
+        cmd_yaw.abs() < straight_walk_yaw_threshold
+    )
+    return torch.where(is_straight_walk, torch.ones_like(tracking), tracking)
