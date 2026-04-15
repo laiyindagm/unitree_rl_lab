@@ -631,3 +631,83 @@ def track_ang_vel_z_scheduled_sigma(
         cmd_yaw.abs() < straight_walk_yaw_threshold
     )
     return torch.where(is_straight_walk, torch.ones_like(tracking), tracking)
+
+
+# ---------------------------------------------------------------------------
+# V14: Dead-zone busting rewards
+# ---------------------------------------------------------------------------
+
+
+def cmd_nonresponse_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.15,
+    vel_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize standing still when a non-trivial velocity command is active.
+
+    Returns 1.0 when |cmd| > cmd_threshold AND |body_vel| < vel_threshold,
+    i.e. the robot is ignoring the command.  Returns 0.0 otherwise.
+
+    This creates a direct negative gradient against the "rational laziness"
+    equilibrium where the Gaussian tracking kernel gives high free reward
+    for standing still at low command speeds.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    cmd_norm = torch.norm(cmd[:, :2], dim=1) + cmd[:, 2].abs()
+    body_vel = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1) + asset.data.root_ang_vel_b[:, 2].abs()
+    return ((cmd_norm > cmd_threshold) & (body_vel < vel_threshold)).float()
+
+
+def rotation_double_support_slide_penalty_gated(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    min_yaw_cmd: float = 0.3,
+) -> torch.Tensor:
+    """Same as rotation_double_support_slide_penalty but only active above min_yaw_cmd.
+
+    At low yaw commands the robot is still learning *whether* to rotate;
+    constraining *how* it rotates too early creates a dead zone.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    n_contacts = is_contact.sum(dim=-1)
+    is_double = (n_contacts >= 2).float()
+
+    foot_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
+    slide = torch.norm(foot_vel, dim=-1).sum(dim=-1)
+
+    cmd = env.command_manager.get_command(command_name)
+    cmd_lin_norm = torch.norm(cmd[:, :2], dim=1)
+    cmd_yaw_abs = cmd[:, 2].abs()
+    is_pure_rot = (cmd_lin_norm < 0.1) & (cmd_yaw_abs > min_yaw_cmd)
+    return slide * is_double * is_pure_rot.float()
+
+
+def rotation_twist_joint_penalty_gated(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    sensor_cfg: SceneEntityCfg,
+    min_yaw_cmd: float = 0.3,
+) -> torch.Tensor:
+    """Same as rotation_twist_joint_penalty but only active above min_yaw_cmd."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    is_contact = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids] > 0
+    n_contacts = is_contact.sum(dim=-1)
+    is_double = (n_contacts >= 2).float()
+
+    twist_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    twist_penalty = torch.sum(twist_vel.abs(), dim=-1)
+
+    cmd = env.command_manager.get_command(command_name)
+    cmd_lin_norm = torch.norm(cmd[:, :2], dim=1)
+    cmd_yaw_abs = cmd[:, 2].abs()
+    is_pure_rot = (cmd_lin_norm < 0.1) & (cmd_yaw_abs > min_yaw_cmd)
+    return twist_penalty * is_double * is_pure_rot.float()
