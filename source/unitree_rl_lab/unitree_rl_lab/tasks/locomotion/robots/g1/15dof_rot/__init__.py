@@ -475,3 +475,19 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
     },
 )
+
+# ---------------------------------------------------------------------------
+# V15 — Performance-Weighted Adaptive Command Sampling
+# V15a: V14b rewards + inverse-performance bin sampling (no monotonic
+#        difficulty assumption; empirically discovers hard speed regions)
+# ---------------------------------------------------------------------------
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V15a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
