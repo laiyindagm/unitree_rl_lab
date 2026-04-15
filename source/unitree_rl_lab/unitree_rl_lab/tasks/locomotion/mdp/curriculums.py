@@ -345,9 +345,12 @@ def _sampling_entropy(speed_probs: torch.Tensor, yaw_probs: torch.Tensor) -> tor
     on specific bins.
     """
     def _norm_entropy(p: torch.Tensor) -> float:
+        n = len(p)
+        if n <= 1:
+            return 1.0  # single bin is trivially uniform
         h = -(p * (p + 1e-8).log()).sum()
-        h_max = (len(p) * torch.tensor(1e-8)).log().neg() if len(p) == 1 else torch.tensor(len(p), dtype=torch.float).log()
-        return (h / h_max).item() if h_max > 0 else 1.0
+        h_max = torch.tensor(n, dtype=torch.float).log()
+        return (h / h_max).clamp(0.0, 1.0).item()
 
     s_ent = _norm_entropy(speed_probs)
     y_ent = _norm_entropy(yaw_probs)

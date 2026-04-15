@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import MISSING
 
 from isaaclab.envs.mdp import UniformVelocityCommandCfg, UniformVelocityCommand
@@ -207,7 +208,7 @@ class PerformanceWeightedVelocityCommand(UniformLevelVelocityCommand):
         ly_lo, ly_hi = ranges.lin_vel_y[0], ranges.lin_vel_y[1]
 
         # Sample angle uniformly in [-pi, pi], then clamp to feasible range
-        angle = torch.empty(n, device=self.device).uniform_(-3.14159, 3.14159)
+        angle = torch.empty(n, device=self.device).uniform_(-math.pi, math.pi)
         vx = sampled_speed * torch.cos(angle)
         vy = sampled_speed * torch.sin(angle)
 
