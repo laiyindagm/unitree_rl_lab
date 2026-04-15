@@ -631,3 +631,107 @@ def track_ang_vel_z_scheduled_sigma(
         cmd_yaw.abs() < straight_walk_yaw_threshold
     )
     return torch.where(is_straight_walk, torch.ones_like(tracking), tracking)
+
+
+"""
+V14 reward functions — baselined tracking & speed-gated auxiliary.
+"""
+
+
+def track_lin_vel_xy_baselined(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Linear velocity tracking with baseline subtraction.
+
+    Returns exp(-error²/σ²) - exp(-cmd²/σ²), so standing still at non-zero
+    command gives exactly 0 reward instead of the usual ~0.85 free reward.
+    Result is clamped to [0, ∞) — no penalty for anti-tracking, just zero.
+
+    This eliminates the local optimum where the policy prefers standing still
+    over tracking at low speed because the exp kernel gives nearly-free reward.
+    """
+    asset = env.scene[asset_cfg.name]
+    vel_yaw = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    error_sq = torch.sum(torch.square(cmd - vel_yaw[:, :2]), dim=1)
+    cmd_sq = torch.sum(torch.square(cmd), dim=1)
+    tracking = torch.exp(-error_sq / std**2)
+    baseline = torch.exp(-cmd_sq / std**2)
+    return torch.clamp(tracking - baseline, min=0.0)
+
+
+def track_ang_vel_z_baselined(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    straight_walk_lin_threshold: float = 0.1,
+    straight_walk_yaw_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Angular velocity tracking with baseline subtraction.
+
+    Same straight-walk bypass as track_ang_vel_z_rotating_aware.
+    Standing still at non-zero yaw command gives 0 instead of ~0.85.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+
+    error_sq = (actual_yaw - cmd_yaw).square()
+    cmd_yaw_sq = cmd_yaw.square()
+    tracking = torch.exp(-error_sq / std**2)
+    baseline = torch.exp(-cmd_yaw_sq / std**2)
+    result = torch.clamp(tracking - baseline, min=0.0)
+
+    cmd_lin_norm = torch.norm(cmd[:, :2], dim=1)
+    is_straight_walk = (cmd_lin_norm > straight_walk_lin_threshold) & (
+        cmd_yaw.abs() < straight_walk_yaw_threshold
+    )
+    return torch.where(is_straight_walk, torch.zeros_like(result), result)
+
+
+def feet_gait_speed_scaled(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float],
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    command_name: str,
+    speed_gate: float = 0.3,
+) -> torch.Tensor:
+    """Speed-scaled gait reward: scales linearly with command magnitude.
+
+    At cmd_norm < speed_gate, the reward is proportionally reduced.
+    At cmd_norm = 0, the reward is 0 (no forced stepping when standing still).
+    This allows the policy to learn speed-appropriate step sizes instead of
+    full stepping at all speeds.
+    """
+    base_reward = feet_gait(env, period, offset, sensor_cfg, threshold, command_name)
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    gate = torch.clamp(cmd_norm / speed_gate, 0.0, 1.0)
+    return base_reward * gate
+
+
+def foot_clearance_speed_scaled(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    command_name: str = "base_velocity",
+    speed_gate: float = 0.3,
+) -> torch.Tensor:
+    """Speed-scaled foot clearance reward: scales linearly with command magnitude.
+
+    At cmd_norm < speed_gate, the clearance target is proportionally relaxed.
+    This allows the policy to shuffle at low speeds instead of lifting feet
+    to full target_height.
+    """
+    base_reward = foot_clearance_reward(env, asset_cfg, target_height, std, tanh_mult)
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    gate = torch.clamp(cmd_norm / speed_gate, 0.0, 1.0)
+    return base_reward * gate
