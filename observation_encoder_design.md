@@ -203,7 +203,7 @@ $$z_c = \underbrace{z_A + z_B}_{\text{加法组合}} + \underbrace{\text{MLP}_{i
 
 **维度选择**：$d_A = d_B = d_c = 32$，嵌入表大小：
 
-$$|\mathcal{A}| \times d_c + |\mathcal{B}| \times d_c + \text{MLP}_{inter} \approx 5 \times 32 + 4 \times 32 + 32 \times 32 = 1,312 \text{ params}$$
+$$|\mathcal{A}| \times d_c + |\mathcal{B}| \times d_c + \text{MLP}_{inter} \approx 5 \times 32 + 4 \times 32 + (32 \times 32 + 32) \times 2 = 2,400 \text{ params}$$
 
 对比 one-hot 的 20D（看似更少，但不具泛化性且不可扩展）。
 
@@ -475,8 +475,8 @@ class CommandEncoder(nn.Module):
             nn.ELU(),
             nn.Linear(d_cmd, d_cmd),
         )
-        # 零初始化交互项，训练初期退化为纯加法
-        nn.init.zeros_(self.interaction_mlp[-1].weight)
+        # 近零初始化交互项，训练初期近似退化为纯加法
+        nn.init.normal_(self.interaction_mlp[-1].weight, std=1e-3)
         nn.init.zeros_(self.interaction_mlp[-1].bias)
 
     def forward(self, cmd_A_idx, cmd_B_idx):
