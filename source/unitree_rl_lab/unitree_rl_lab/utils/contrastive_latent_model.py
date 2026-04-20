@@ -1,0 +1,597 @@
+"""Contrastive Latent Policy (CLP) model.
+
+Dual-encoder (TCN / Transformer) → product-sphere projection → FiLM-conditioned
+sequence prediction.  Integrates with rsl_rl MLPModel via ``get_latent()`` override.
+
+Key data flow (training):
+    flat_obs [B, 5×54]
+    → split: history_no_cmd [B, 5, 51], cmd [B, 3], o_current [B, 51]
+    → Encoder(history_no_cmd) → h_enc [B, 96]
+    → ProductSphereProjection(h_enc) → (z_x, z_y, z_w) each [B, 32]
+    → z_cat = cat(z_x, z_y, z_w) [B, 96]
+    → FiLMGenerator(z_cat, cmd) → a_pred [B, 45]
+    → latent = cat(o_current, cmd, z_cat, a_pred).detach()  [B, 195]
+    → MLP backbone [224 → 512 → 256 → 128] → distribution → action
+"""
+
+from __future__ import annotations
+
+import copy
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tensordict import TensorDict
+
+from rsl_rl.models.mlp_model import MLPModel
+from rsl_rl.modules import HiddenState
+
+
+# ---------------------------------------------------------------------------
+# TCN encoder components
+# ---------------------------------------------------------------------------
+
+class CausalConv1d(nn.Module):
+    """1-D causal convolution with left-padding."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int) -> None:
+        super().__init__()
+        self.pad = kernel_size - 1
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.pad(x, (self.pad, 0))
+        return self.conv(x)
+
+
+class TCNBlock(nn.Module):
+    """Residual TCN block: CausalConv → ELU → Dropout → CausalConv → ELU → + residual."""
+
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            CausalConv1d(in_ch, out_ch, kernel_size),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            CausalConv1d(out_ch, out_ch, kernel_size),
+            nn.ELU(),
+        )
+        self.residual = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x) + self.residual(x)
+
+
+class TCNEncoder(nn.Module):
+    """Temporal Convolutional Network encoder.
+
+    Takes [B, T, D_obs] → [B, enc_dim].
+    2-layer TCN with kernel_size=3 gives receptive field = 5 = history_len.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        channels: list[int] | None = None,
+        kernel_size: int = 3,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if channels is None:
+            channels = [64, 96]
+        layers: list[nn.Module] = []
+        prev_ch = input_dim
+        for ch in channels:
+            layers.append(TCNBlock(prev_ch, ch, kernel_size, dropout))
+            prev_ch = ch
+        self.network = nn.Sequential(*layers)
+        self.output_dim = channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D] → [B, enc_dim]."""
+        h = self.network(x.transpose(1, 2))  # [B, enc_dim, T]
+        return h[:, :, -1]  # last time-step
+
+
+# ---------------------------------------------------------------------------
+# Transformer encoder
+# ---------------------------------------------------------------------------
+
+class CLPTransformerEncoder(nn.Module):
+    """Transformer-based history encoder for CLP.
+
+    Linear(D_obs → d_model) + pos_emb + causal TransformerEncoder + last token
+    + Linear(d_model → enc_dim).
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        history_len: int,
+        enc_dim: int = 96,
+        d_model: int = 256,
+        n_heads: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 512,
+    ) -> None:
+        super().__init__()
+        self.output_dim = enc_dim
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, history_len, d_model) * 0.1)
+
+        causal_mask = torch.triu(
+            torch.ones(history_len, history_len, dtype=torch.bool), diagonal=1
+        )
+        self.register_buffer("causal_mask", causal_mask)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.output_proj = nn.Linear(d_model, enc_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, D] → [B, enc_dim]."""
+        h = self.input_proj(x) + self.pos_emb
+        h = self.encoder(h, mask=self.causal_mask)
+        return self.output_proj(h[:, -1, :])
+
+
+# ---------------------------------------------------------------------------
+# Product-sphere projection & contrastive projector
+# ---------------------------------------------------------------------------
+
+class ProductSphereProjection(nn.Module):
+    """Map encoder output to a product of unit hyperspheres.
+
+    enc_dim → Linear → split into num_spheres × sphere_dim → L2-normalize each.
+    """
+
+    def __init__(self, enc_dim: int = 96, sphere_dim: int = 32, num_spheres: int = 3) -> None:
+        super().__init__()
+        self.sphere_dim = sphere_dim
+        self.num_spheres = num_spheres
+        self.proj = nn.Linear(enc_dim, num_spheres * sphere_dim)
+
+    def forward(self, h: torch.Tensor) -> list[torch.Tensor]:
+        """h: [B, enc_dim] → list of num_spheres tensors [B, sphere_dim] on unit sphere."""
+        raw = self.proj(h)
+        chunks = raw.split(self.sphere_dim, dim=-1)
+        return [F.normalize(c, dim=-1) for c in chunks]
+
+
+class ContrastiveProjector(nn.Module):
+    """Training-only MLP projection head for each sphere: sphere_dim → hidden → sphere_dim → L2."""
+
+    def __init__(self, sphere_dim: int = 32, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(sphere_dim, hidden_dim),
+            nn.ELU(),
+            nn.Linear(hidden_dim, sphere_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return F.normalize(self.net(z), dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Command embedding & FiLM generator
+# ---------------------------------------------------------------------------
+
+class CommandEmbedding(nn.Module):
+    """Embed continuous velocity command [vx, vy, wz] → e_c."""
+
+    def __init__(self, cmd_dim: int = 3, embed_dim: int = 32) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cmd_dim, 64),
+            nn.ELU(),
+            nn.Linear(64, embed_dim),
+        )
+
+    def forward(self, cmd: torch.Tensor) -> torch.Tensor:
+        return self.net(cmd)
+
+
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation: out = (1 + gamma) * h + beta."""
+
+    def __init__(self, cond_dim: int, feat_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(cond_dim, feat_dim * 2)
+
+    def forward(self, h: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gb = self.proj(cond)
+        gamma, beta = gb.chunk(2, dim=-1)
+        return (1.0 + gamma) * h + beta
+
+
+class FiLMGenerator(nn.Module):
+    """FiLM-conditioned sequence prediction: (z_cat, e_c) → future action predictions.
+
+    Predicts pred_horizon steps × num_actions actions.
+    """
+
+    def __init__(
+        self,
+        enc_dim: int = 96,
+        cond_dim: int = 3,
+        pred_horizon: int = 3,
+        num_actions: int = 15,
+    ) -> None:
+        super().__init__()
+        self.film = FiLMLayer(cond_dim=cond_dim, feat_dim=enc_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(enc_dim, 128),
+            nn.ELU(),
+            nn.Linear(128, pred_horizon * num_actions),
+        )
+
+    def forward(self, z_cat: torch.Tensor, e_c: torch.Tensor) -> torch.Tensor:
+        modulated = self.film(z_cat, e_c)
+        return self.mlp(modulated)
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
+
+class ContrastiveLatentModel(MLPModel):
+    """CLP actor model with TCN/Transformer encoder, product sphere, and FiLM generator.
+
+    Overrides ``get_latent()`` to produce representation-enriched features for the MLP policy.
+    """
+
+    is_recurrent: bool = False
+
+    def __init__(
+        self,
+        obs: TensorDict,
+        obs_groups: dict[str, list[str]],
+        obs_set: str,
+        output_dim: int,
+        hidden_dims: tuple[int, ...] | list[int] = (512, 256, 128),
+        activation: str = "elu",
+        obs_normalization: bool = False,
+        distribution_cfg: dict | None = None,
+        # CLP-specific
+        encoder_type: str = "tcn",
+        history_len: int = 5,
+        history_obs_dim: int = 51,
+        cmd_dim: int = 3,
+        cmd_start_idx: int = 6,
+        enc_dim: int = 96,
+        sphere_dim: int = 32,
+        num_spheres: int = 3,
+        # TCN params
+        tcn_channels: list[int] | None = None,
+        tcn_kernel_size: int = 3,
+        # Transformer params
+        tf_d_model: int = 256,
+        tf_n_heads: int = 4,
+        tf_num_layers: int = 2,
+        tf_dim_feedforward: int = 512,
+        # Generator params
+        pred_horizon: int = 3,
+        num_actions: int = 15,
+    ) -> None:
+        # Store CLP config before super().__init__ (which calls _get_latent_dim)
+        self.encoder_type = encoder_type
+        self.history_len = history_len
+        self.history_obs_dim = history_obs_dim
+        self.cmd_dim = cmd_dim
+        self.cmd_start_idx = cmd_start_idx
+        self.enc_dim = enc_dim
+        self.sphere_dim = sphere_dim
+        self.num_spheres = num_spheres
+        self.pred_horizon = pred_horizon
+        self._num_actions = num_actions
+
+        # single_obs_dim = history_obs_dim + cmd_dim
+        self.single_obs_dim = history_obs_dim + cmd_dim
+
+        # Compute latent dim: o_current + e_c + z_cat + a_pred
+        self._latent_dim = (
+            history_obs_dim              # o_current (51)
+            + cmd_dim                    # raw cmd (3)
+            + num_spheres * sphere_dim   # z_cat (96)
+            + pred_horizon * num_actions # a_pred (45)
+        )
+
+        super().__init__(
+            obs, obs_groups, obs_set, output_dim,
+            hidden_dims, activation, obs_normalization, distribution_cfg,
+        )
+
+        # --- Encoder ---
+        if encoder_type == "tcn":
+            self.encoder = TCNEncoder(
+                input_dim=history_obs_dim,
+                channels=tcn_channels or [64, 96],
+                kernel_size=tcn_kernel_size,
+            )
+        elif encoder_type == "transformer":
+            self.encoder = CLPTransformerEncoder(
+                input_dim=history_obs_dim,
+                history_len=history_len,
+                enc_dim=enc_dim,
+                d_model=tf_d_model,
+                n_heads=tf_n_heads,
+                num_layers=tf_num_layers,
+                dim_feedforward=tf_dim_feedforward,
+            )
+        else:
+            raise ValueError(f"Unknown encoder_type: {encoder_type!r}")
+
+        assert self.encoder.output_dim == enc_dim, (
+            f"Encoder output_dim={self.encoder.output_dim} != enc_dim={enc_dim}"
+        )
+
+        # --- Sphere projection ---
+        self.sphere_proj = ProductSphereProjection(enc_dim, sphere_dim, num_spheres)
+
+        # --- Contrastive projector (training only, one per sphere) ---
+        self.contrast_projs = nn.ModuleList(
+            [ContrastiveProjector(sphere_dim) for _ in range(num_spheres)]
+        )
+
+
+        # --- FiLM generator ---
+        self.generator = FiLMGenerator(
+            enc_dim=num_spheres * sphere_dim,
+            cond_dim=cmd_dim,
+            pred_horizon=pred_horizon,
+            num_actions=num_actions,
+        )
+
+        # Cache for two-phase training
+        self._cached_z_cat: torch.Tensor | None = None
+        self._cached_cmd: torch.Tensor | None = None
+        self._cached_a_pred: torch.Tensor | None = None
+        self._cached_o_current: torch.Tensor | None = None
+
+    def _get_latent_dim(self) -> int:
+        return self._latent_dim
+
+    # ------------------------------------------------------------------
+    # Observation splitting
+    # ------------------------------------------------------------------
+
+    def _split_obs(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Split flat stacked observation into history (no cmd), command, and current obs.
+
+        Args:
+            flat_obs: [B, history_len * single_obs_dim]
+
+        Returns:
+            history_no_cmd: [B, history_len, history_obs_dim]
+            cmd: [B, cmd_dim]  (from last frame)
+            o_current: [B, history_obs_dim]  (last frame, no cmd)
+        """
+        B = flat_obs.shape[0]
+        frames = flat_obs.view(B, self.history_len, self.single_obs_dim)
+        cmd = frames[:, -1, self.cmd_start_idx : self.cmd_start_idx + self.cmd_dim]
+        before_cmd = frames[:, :, :self.cmd_start_idx]
+        after_cmd = frames[:, :, self.cmd_start_idx + self.cmd_dim:]
+        history_no_cmd = torch.cat([before_cmd, after_cmd], dim=-1)
+        o_current = history_no_cmd[:, -1, :]
+        return history_no_cmd, cmd, o_current
+
+    # ------------------------------------------------------------------
+    # Public encode / project methods (used by ContrastivePPO)
+    # ------------------------------------------------------------------
+
+    def encode(self, flat_obs: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Full encoding for representation learning (Phase A).
+
+        Returns:
+            z_spheres: list of [B, sphere_dim] on unit spheres
+            cmd: [B, cmd_dim]
+            o_current: [B, history_obs_dim]
+        """
+        flat_obs = self.obs_normalizer(flat_obs)
+        history_no_cmd, cmd, o_current = self._split_obs(flat_obs)
+        h_enc = self.encoder(history_no_cmd)
+        z_spheres = self.sphere_proj(h_enc)
+        return z_spheres, cmd, o_current
+
+    def project_contrastive(self, z_spheres: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Apply training-only contrastive projectors."""
+        return [proj(z) for proj, z in zip(self.contrast_projs, z_spheres)]
+
+    def get_cmd_from_obs(self, flat_obs: torch.Tensor) -> torch.Tensor:
+        """Extract cmd from flat obs (without normalizing)."""
+        B = flat_obs.shape[0]
+        frames = flat_obs.view(B, self.history_len, self.single_obs_dim)
+        return frames[:, -1, self.cmd_start_idx : self.cmd_start_idx + self.cmd_dim]
+
+    # ------------------------------------------------------------------
+    # Cache interface for two-phase PPO
+    # ------------------------------------------------------------------
+
+    def get_cached_repr(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return representations from the last get_latent() call."""
+        assert self._cached_z_cat is not None, "Call get_latent() first"
+        return self._cached_z_cat, self._cached_cmd, self._cached_a_pred, self._cached_o_current
+
+    @staticmethod
+    def get_latent_from_cache(
+        o_current: torch.Tensor,
+        cmd: torch.Tensor,
+        z_cat: torch.Tensor,
+        a_pred: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the latent vector from cached components (Phase B)."""
+        return torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
+
+    # ------------------------------------------------------------------
+    # MLPModel override
+    # ------------------------------------------------------------------
+
+    def get_latent(
+        self,
+        obs: TensorDict,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+    ) -> torch.Tensor:
+        """Encode observation into the latent representation for the MLP backbone."""
+        obs_list = [obs[k] for k in self.obs_groups]
+        flat_obs = torch.cat(obs_list, dim=-1)
+        flat_obs = self.obs_normalizer(flat_obs)
+
+        history_no_cmd, cmd, o_current = self._split_obs(flat_obs)
+
+        h_enc = self.encoder(history_no_cmd)
+        z_spheres = self.sphere_proj(h_enc)
+        z_cat = torch.cat(z_spheres, dim=-1)
+
+        a_pred = self.generator(z_cat, cmd)
+
+        # Cache for two-phase PPO (detached)
+        self._cached_z_cat = z_cat.detach()
+        self._cached_cmd = cmd.detach()
+        self._cached_a_pred = a_pred.detach()
+        self._cached_o_current = o_current.detach()
+
+        # Detach to block gradient from PPO into representation
+        return torch.cat([o_current, cmd, z_cat, a_pred], dim=-1).detach()
+
+    # ------------------------------------------------------------------
+    # Phase B evaluation (bypass get_latent, use cached latent directly)
+    # ------------------------------------------------------------------
+
+    def evaluate_from_latent(self, latent: torch.Tensor, stochastic_output: bool = False) -> torch.Tensor:
+        """Run MLP backbone + distribution from a pre-built latent vector.
+
+        Used in Phase B of two-phase PPO to avoid re-encoding.
+        """
+        mlp_output = self.mlp(latent)
+        if self.distribution is not None:
+            if stochastic_output:
+                self.distribution.update(mlp_output)
+                return self.distribution.sample()
+            return self.distribution.deterministic_output(mlp_output)
+        return mlp_output
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def as_jit(self) -> nn.Module:
+        return _TorchCLPModel(self)
+
+    def as_onnx(self, verbose: bool = False) -> nn.Module:
+        return _OnnxCLPModel(self, verbose)
+
+
+# ---------------------------------------------------------------------------
+# Exportable models (inference only — no contrastive projectors)
+# ---------------------------------------------------------------------------
+
+class _TorchCLPModel(nn.Module):
+    """JIT-exportable CLP model for deployment."""
+
+    def __init__(self, model: ContrastiveLatentModel) -> None:
+        super().__init__()
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.history_len = model.history_len
+        self.single_obs_dim = model.single_obs_dim
+        self.history_obs_dim = model.history_obs_dim
+        self.cmd_dim = model.cmd_dim
+        self.cmd_start_idx = model.cmd_start_idx
+        self.encoder = copy.deepcopy(model.encoder)
+        self.sphere_proj = copy.deepcopy(model.sphere_proj)
+        self.generator = copy.deepcopy(model.generator)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+    def _split_obs(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = flat_obs.shape[0]
+        frames = flat_obs.view(B, self.history_len, self.single_obs_dim)
+        cmd = frames[:, -1, self.cmd_start_idx : self.cmd_start_idx + self.cmd_dim]
+        before_cmd = frames[:, :, :self.cmd_start_idx]
+        after_cmd = frames[:, :, self.cmd_start_idx + self.cmd_dim:]
+        history_no_cmd = torch.cat([before_cmd, after_cmd], dim=-1)
+        o_current = history_no_cmd[:, -1, :]
+        return history_no_cmd, cmd, o_current
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.obs_normalizer(x)
+        history_no_cmd, cmd, o_current = self._split_obs(x)
+        h_enc = self.encoder(history_no_cmd)
+        z_spheres = self.sphere_proj(h_enc)
+        z_cat = torch.cat(z_spheres, dim=-1)
+        a_pred = self.generator(z_cat, cmd)
+        latent = torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
+        out = self.mlp(latent)
+        return self.deterministic_output(out)
+
+    @torch.jit.export
+    def reset(self) -> None:
+        pass
+
+
+class _OnnxCLPModel(nn.Module):
+    """ONNX-exportable CLP model for deployment."""
+
+    is_recurrent: bool = False
+
+    def __init__(self, model: ContrastiveLatentModel, verbose: bool) -> None:
+        super().__init__()
+        self.verbose = verbose
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.history_len = model.history_len
+        self.single_obs_dim = model.single_obs_dim
+        self.history_obs_dim = model.history_obs_dim
+        self.cmd_dim = model.cmd_dim
+        self.cmd_start_idx = model.cmd_start_idx
+        self.encoder = copy.deepcopy(model.encoder)
+        self.sphere_proj = copy.deepcopy(model.sphere_proj)
+        self.generator = copy.deepcopy(model.generator)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+        self.input_size = model.obs_dim
+
+    def _split_obs(self, flat_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = flat_obs.shape[0]
+        frames = flat_obs.view(B, self.history_len, self.single_obs_dim)
+        cmd = frames[:, -1, self.cmd_start_idx : self.cmd_start_idx + self.cmd_dim]
+        before_cmd = frames[:, :, :self.cmd_start_idx]
+        after_cmd = frames[:, :, self.cmd_start_idx + self.cmd_dim:]
+        history_no_cmd = torch.cat([before_cmd, after_cmd], dim=-1)
+        o_current = history_no_cmd[:, -1, :]
+        return history_no_cmd, cmd, o_current
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.obs_normalizer(x)
+        history_no_cmd, cmd, o_current = self._split_obs(x)
+        h_enc = self.encoder(history_no_cmd)
+        z_spheres = self.sphere_proj(h_enc)
+        z_cat = torch.cat(z_spheres, dim=-1)
+        a_pred = self.generator(z_cat, cmd)
+        latent = torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
+        out = self.mlp(latent)
+        return self.deterministic_output(out)
+
+    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
+        return (torch.zeros(1, self.input_size),)
+
+    @property
+    def input_names(self) -> list[str]:
+        return ["obs"]
+
+    @property
+    def output_names(self) -> list[str]:
+        return ["actions"]

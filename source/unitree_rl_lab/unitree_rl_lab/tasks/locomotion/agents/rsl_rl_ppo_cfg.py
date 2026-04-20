@@ -37,7 +37,7 @@ class RslRlTransformerModelCfg(RslRlMLPModelCfg):
 @configclass
 class BasePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
-    max_iterations = 15000
+    max_iterations = 20000
     save_interval = 500
     experiment_name = ""
     empirical_normalization = False
@@ -346,4 +346,124 @@ class G115DofTransformerAuxPPORunnerCfg(BasePPORunnerCfg):
         max_grad_norm=1.0,
         aux_loss_coef=0.5,
         aux_loss_schedule=[0.5, 0.05, 0, 5000],
+    )
+
+
+# ---- Contrastive Latent Policy (CLP) ----
+
+@configclass
+class RslRlContrastiveModelCfg(RslRlMLPModelCfg):
+    """ContrastiveLatentModel configuration."""
+
+    class_name: str = "unitree_rl_lab.utils.contrastive_latent_model:ContrastiveLatentModel"
+    encoder_type: str = "tcn"        # "tcn" | "transformer"
+    history_len: int = 5
+    history_obs_dim: int = 51        # single frame without cmd
+    cmd_dim: int = 3
+    cmd_start_idx: int = 6           # cmd position in single-frame obs
+    enc_dim: int = 96                # encoder output dim
+    sphere_dim: int = 32             # per-sphere dim
+    num_spheres: int = 3
+    # TCN parameters
+    tcn_channels: list[int] | None = None  # default [64, 96]
+    tcn_kernel_size: int = 3
+    # Transformer parameters
+    tf_d_model: int = 256
+    tf_n_heads: int = 4
+    tf_num_layers: int = 2
+    tf_dim_feedforward: int = 512
+    # Generator parameters
+    pred_horizon: int = 3
+    num_actions: int = 15
+
+
+@configclass
+class RslRlContrastivePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """ContrastivePPO algorithm configuration."""
+
+    class_name: str = "unitree_rl_lab.utils.contrastive_ppo:ContrastivePPO"
+    nce_coef: float = 0.1            # alpha — InfoNCE coefficient
+    gen_coef: float = 0.5            # beta start — sequence prediction coefficient
+    gen_coef_end: float = 0.1        # beta end
+    gen_decay_iters: int = 10000     # beta decay iterations
+    tau_init: float = 0.5            # temperature initial value
+    learnable_tau: bool = True
+    repr_lr: float = 1e-4            # representation learning rate
+    warmup_iters: int = 0            # disabled — optimizer separation makes warmup redundant
+    pred_gamma: float = 0.9          # temporal decay for sequence prediction
+    # Velocity quantization levels (aligned with V19d MarginalVelocityCommand bins)
+    vx_levels: list[float] | None = None
+    vy_levels: list[float] | None = None
+    wz_levels: list[float] | None = None
+
+
+@configclass
+class G115DofContrastiveTCNPPORunnerCfg(BasePPORunnerV3Cfg):
+    """G1 15-DOF CLP Runner with TCN encoder."""
+
+    actor = RslRlContrastiveModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        encoder_type="tcn",
+    )
+
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=None,
+    )
+
+    algorithm = RslRlContrastivePpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        nce_coef=0.1,
+        # gen_coef=0.5,
+        gen_coef=0.0,
+        gen_coef_end=0.0
+    )
+
+
+@configclass
+class G115DofContrastiveTransformerPPORunnerCfg(BasePPORunnerV3Cfg):
+    """G1 15-DOF CLP Runner with Transformer encoder."""
+
+    actor = RslRlContrastiveModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        encoder_type="transformer",
+    )
+
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=None,
+    )
+
+    algorithm = RslRlContrastivePpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        nce_coef=0.1,
+        gen_coef=0.5,
     )

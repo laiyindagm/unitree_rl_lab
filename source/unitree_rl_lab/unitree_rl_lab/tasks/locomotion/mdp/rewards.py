@@ -735,3 +735,233 @@ def foot_clearance_speed_scaled(
     cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
     gate = torch.clamp(cmd_norm / speed_gate, 0.0, 1.0)
     return base_reward * gate
+
+
+# ============================================================================
+# V15: cmd nonresponse penalty
+# ============================================================================
+
+
+def cmd_nonresponse_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.15,
+    vel_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize standing still when a non-trivial velocity command is active.
+
+    Returns a penalty (positive value, to be used with negative weight) that is
+    proportional to the gap between commanded and actual speed when:
+      - cmd_norm > cmd_threshold  (non-trivial command)
+      - body_vel_norm < vel_threshold  (robot is essentially stationary)
+
+    This directly breaks the "standing is safe" equilibrium by making standing
+    under command costly, providing explicit gradient to start moving.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_norm = torch.norm(cmd, dim=1)
+
+    root_vel = env.scene["robot"].data.root_lin_vel_b[:, :2]
+    root_ang_vel = env.scene["robot"].data.root_ang_vel_b[:, 2:3]
+    body_vel_norm = torch.norm(torch.cat([root_vel, root_ang_vel], dim=1), dim=1)
+
+    has_cmd = cmd_norm > cmd_threshold
+    is_still = body_vel_norm < vel_threshold
+
+    # Penalty scales with how large the command is (stronger cmd -> bigger penalty)
+    penalty = torch.where(has_cmd & is_still, cmd_norm, torch.zeros_like(cmd_norm))
+    return penalty
+
+
+# ============================================================================
+# V16b: scheduled movement incentive
+# ============================================================================
+
+
+def movement_incentive_scheduled(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    std: float = 0.25,
+    cmd_threshold: float = 0.05,
+    start_step: int = 72000,
+    end_step: int = 120000,
+) -> torch.Tensor:
+    """Smooth penalty for standing still when a velocity command is active.
+
+    Tent-shaped: max penalty at vel=0, linearly decreasing to 0 at vel >= std.
+    Scales with command magnitude (stronger command -> larger penalty).
+    Scheduled to ramp from 0 to full strength between start_step and end_step
+    of env.common_step_counter, preserving early training stability.
+
+    Returns positive values (use with negative weight in config).
+    """
+    # Schedule ramp (scalar, not tensor)
+    progress = (env.common_step_counter - start_step) / max(end_step - start_step, 1)
+    schedule = max(0.0, min(progress, 1.0))
+    if schedule <= 0.0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    # Robot velocity proxy: max of linear speed and angular speed
+    lin_vel = torch.norm(env.scene["robot"].data.root_lin_vel_b[:, :2], dim=1)
+    ang_vel = torch.abs(env.scene["robot"].data.root_ang_vel_b[:, 2])
+    vel_proxy = torch.max(lin_vel, ang_vel)
+
+    # Tent: 1 at vel=0, linearly decreasing to 0 at vel=std
+    standing_degree = torch.clamp(1.0 - vel_proxy / std, min=0.0)
+
+    # Scale by command magnitude
+    cmd = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(cmd[:, :2], dim=1) + torch.abs(cmd[:, 2])
+    cmd_speed = cmd_speed * (cmd_speed > cmd_threshold).float()
+
+    return schedule * standing_degree * cmd_speed
+
+
+# ============================================================================
+# V19e: rotation-skip linear tracking & wz nonresponse
+# ============================================================================
+
+
+def track_lin_vel_xy_rotation_skip(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    lin_threshold: float = 0.05,
+    yaw_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Linear velocity tracking that returns 1.0 for pure-rotation commands.
+
+    When the commanded linear velocity is near-zero and commanded yaw is
+    non-trivial, xy tracking reward = 1.0.  This removes the gradient that
+    opposes rotation (parasitic translation from turning reduces standard
+    tracking reward).  For all other commands, tracks normally.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+
+    vel_yaw = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    lin_vel_error = torch.sum(torch.square(cmd[:, :2] - vel_yaw[:, :2]), dim=1)
+    tracking = torch.exp(-lin_vel_error / std**2)
+
+    is_pure_rotation = (torch.norm(cmd[:, :2], dim=1) < lin_threshold) & (cmd[:, 2].abs() > yaw_threshold)
+    return torch.where(is_pure_rotation, torch.ones_like(tracking), tracking)
+
+
+def wz_nonresponse_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.08,
+    vel_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize standing still when a yaw command is active.
+
+    Returns a penalty (positive value, use with negative weight) proportional
+    to the commanded yaw magnitude when the robot is not rotating.
+    This specifically targets the wz dead-zone where the exp kernel gives
+    ~96% free reward at small commands.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_wz = cmd[:, 2].abs()
+
+    actual_wz = env.scene["robot"].data.root_ang_vel_b[:, 2].abs()
+
+    has_cmd = cmd_wz > cmd_threshold
+    is_still = actual_wz < vel_threshold
+
+    penalty = torch.where(has_cmd & is_still, cmd_wz, torch.zeros_like(cmd_wz))
+    return penalty
+
+
+# ============================================================================
+# V19e: torso flat orientation
+# ============================================================================
+
+
+def torso_flat_orientation(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="torso_link"),
+) -> torch.Tensor:
+    """Penalize torso tilting away from horizontal.
+
+    Projects the world gravity vector into the torso body frame and penalizes
+    the xy components (roll and pitch tilt).  This directly constrains the
+    camera mounted on the torso to capture level images, regardless of how
+    much the pelvis sways during locomotion.
+
+    Same math as flat_orientation_l2 but on a specified body instead of root.
+    """
+    from isaaclab.utils.math import quat_rotate_inverse
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    # body_quat_w: (N, num_bodies, 4) — select the target body
+    body_quat = asset.data.body_quat_w[:, asset_cfg.body_ids, :]  # (N, 1, 4)
+    body_quat = body_quat.squeeze(1)  # (N, 4)
+
+    # World gravity direction (0, 0, -1)
+    gravity_w = torch.tensor([0.0, 0.0, -1.0], device=env.device).expand(env.num_envs, 3)
+
+    # Project gravity into body frame
+    gravity_b = quat_rotate_inverse(body_quat, gravity_w)
+
+    # Penalize xy components (ideal: gravity_b = [0, 0, -1])
+    return torch.sum(torch.square(gravity_b[:, :2]), dim=1)
+
+
+# ============================================================================
+# V19f: aggressive rotation + zero-speed standing
+# ============================================================================
+
+
+def wz_proportional_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.08,
+) -> torch.Tensor:
+    """Continuous proportional penalty for inaccurate yaw tracking.
+
+    Unlike binary wz_nonresponse (which drops to 0 once actual > threshold),
+    this penalty scales smoothly with tracking quality:
+
+        signed_ratio = clamp(actual_wz * sign(cmd_wz) / |cmd_wz|, 0, 1)
+        penalty = |cmd_wz| * (1 - signed_ratio)
+
+    Provides continuous gradient: partial rotation credited, wrong direction
+    maximally penalized.  Use with negative weight.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_wz = cmd[:, 2]
+    cmd_wz_abs = cmd_wz.abs()
+
+    actual_wz = env.scene["robot"].data.root_ang_vel_b[:, 2]
+
+    has_cmd = cmd_wz_abs > cmd_threshold
+
+    signed_ratio = torch.clamp(
+        actual_wz * cmd_wz.sign() / cmd_wz_abs.clamp(min=cmd_threshold),
+        min=0.0, max=1.0,
+    )
+
+    penalty = cmd_wz_abs * (1.0 - signed_ratio)
+    return torch.where(has_cmd, penalty, torch.zeros_like(penalty))
+
+
+def zero_cmd_body_vel(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize body velocity when no command is active (zero-speed standing).
+
+    Directly penalizes linear + angular root velocity when cmd_norm < threshold.
+    More effective than stand_still (joint deviation) for suppressing movement.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    cmd_norm = torch.norm(cmd, dim=1)
+
+    vel_lin = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    vel_ang = asset.data.root_ang_vel_b[:, 2].abs()
+
+    return (vel_lin + vel_ang) * (cmd_norm < cmd_threshold)

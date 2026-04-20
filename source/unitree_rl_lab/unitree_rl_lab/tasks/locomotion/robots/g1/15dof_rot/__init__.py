@@ -524,3 +524,250 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
     },
 )
+
+# ---- V15: Informed by 001.md Analysis + V14 Lessons ----
+
+# V15a: "Surgical Reward Rebalance" — targeted penalty reduction per 001.md Tier 1
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V15a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V15b: "Adaptive Command Sampling" — V15a rewards + performance-weighted sampling (001.md Plan B)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V15b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V15c: "Wide Start + Anti-Stagnation" — full command range from iter 0, no curriculum
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V15c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v15c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V16a: "Fixed Adaptive Sampling" — redesigned metric (relative accuracy), same V15a rewards
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V16a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V16b: "Low-Speed Incentive" — strong cmd_nonresponse(-2.0) + low-speed bonuses, bucketed curriculum
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V16b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V16c: "Adaptive + Incentive" — V16a sampling + V16b rewards (maximum intervention)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V16c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v16c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# ---- V17: Combined + Targeted Improvements ----
+
+# V17a: "Combined Baseline + Standing Fix" — V16a sampling + V16b incentive + standing fix
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V17a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V17b: "Tighter Incentive + Waist Damping" — V17a + tighter std=0.15 + stronger waist penalties
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V17b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V17c: "Discrete Adaptive Sampling" — discrete velocity levels + staged curriculum + V16b movement incentive
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V17c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v17c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# ---- V18: Bug-Fixed Adaptive Experiments ----
+
+# V18a: "Fixed Adaptive Continuous" — V17a + bug fixes + temp=3.0
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V18a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V18b: "Fixed Discrete Adaptive" — V17c + bug fixes + curriculum threshold=0.3 + temp=3.0
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V18b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V18c: "Pure-Linear Allocation" — V18a + rel_linear_envs=0.20 (dedicated pure-linear practice)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V18c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v18c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# ---- V19: Marginal Axis-Independent Sampling ----
+
+# V19a: "Marginal Continuous" — axis-independent 1D marginal sampling with continuous bin ranges
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19b: "Marginal Discrete" — axis-independent 1D marginal sampling with discrete (lo==hi) bins
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19c: "Pure-Env Accuracy + Anti-Standing" — pure env types, restricted perf, stronger penalties
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+# V19d: "Direction-Gated Accuracy + wz Boost" — noise-immune perf, min-based expansion, focused sampling
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19d",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+
+# V19d-CLP: Contrastive Latent Policy (TCN encoder) on V19d env
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19d-CLP",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofContrastiveTCNPPORunnerCfg",
+    },
+)
+
+# V19d-CLP-Transformer: Contrastive Latent Policy (Transformer encoder) on V19d env
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19d-CLP-Transformer",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofContrastiveTransformerPPORunnerCfg",
+    },
+)
+
+# V19e: "Rotation Gradient Fix" — rotation-skip lin tracking, wz nonresponse, upper body acc
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19e",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19e:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19e:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19f: "Aggressive Rotation" — sharp wz kernel, proportional wz penalty, zero-speed fix
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19f",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19f:RobotEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)

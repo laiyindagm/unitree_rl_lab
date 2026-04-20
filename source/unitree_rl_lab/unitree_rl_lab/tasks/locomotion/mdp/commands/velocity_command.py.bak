@@ -66,8 +66,6 @@ class PerformanceWeightedVelocityCommandCfg(UniformVelocityCommandCfg):
     limit_ranges: UniformVelocityCommandCfg.Ranges = MISSING
     rel_rotating_envs: float = 0.0
     rel_linear_envs: float = 0.0
-    rel_pure_vx_envs: float = 0.0
-    rel_pure_vy_envs: float = 0.0
 
     # Explicit bin edges: list of (lo, hi) tuples defining each bin.
     # The LAST positive and first negative bins are expandable via curriculum.
@@ -135,8 +133,6 @@ class PerformanceWeightedVelocityCommand(UniformVelocityCommand):
         super().__init__(cfg, env)
         self.is_rotating_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.is_linear_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.is_pure_vx_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.is_pure_vy_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         n_vx = len(cfg.vx_bins)
         n_wz = len(cfg.wz_bins)
@@ -273,17 +269,12 @@ class PerformanceWeightedVelocityCommand(UniformVelocityCommand):
 
     def _update_command(self):
         super()._update_command()  # zeros standing envs, computes heading
-        # Enforce pure rotation for rotating envs (pure_wz)
+        # Enforce pure rotation for rotating envs
         rotating_ids = self.is_rotating_env.nonzero(as_tuple=False).flatten()
         self.vel_command_b[rotating_ids, :2] = 0.0
-        # Enforce pure_vx: vy=0, wz=0
-        pure_vx_ids = self.is_pure_vx_env.nonzero(as_tuple=False).flatten()
-        self.vel_command_b[pure_vx_ids, 1] = 0.0
-        self.vel_command_b[pure_vx_ids, 2] = 0.0
-        # Enforce pure_vy: vx=0, wz=0
-        pure_vy_ids = self.is_pure_vy_env.nonzero(as_tuple=False).flatten()
-        self.vel_command_b[pure_vy_ids, 0] = 0.0
-        self.vel_command_b[pure_vy_ids, 2] = 0.0
+        # Enforce pure linear for linear envs
+        linear_ids = self.is_linear_env.nonzero(as_tuple=False).flatten()
+        self.vel_command_b[linear_ids, 2] = 0.0
 
         # --- Accumulate relative tracking accuracy per env ---
         cmd_lin = self.vel_command_b[:, :2]
@@ -616,8 +607,6 @@ class MarginalVelocityCommandCfg(UniformVelocityCommandCfg):
     """Cfg for marginal velocity command with axis-independent sampling."""
     rel_rotating_envs: float = 0.0
     rel_linear_envs: float = 0.0
-    rel_pure_vx_envs: float = 0.0
-    rel_pure_vy_envs: float = 0.0
 
     # Per-direction bin definitions.
     # Each bin is (lo, hi). Discrete: lo==hi -> exact value.
@@ -656,8 +645,6 @@ class MarginalVelocityCommandCfg(UniformVelocityCommandCfg):
     """Minimum command magnitude for accuracy computation."""
     zero_speed_accuracy_threshold: float = 0.10
     """Velocity threshold for zero-speed accuracy."""
-    min_response_speed: float = 0.0
-    """Direction-gated accuracy: actual must exceed this in commanded direction. 0=off."""
 
 
 class MarginalVelocityCommand(UniformVelocityCommand):
@@ -674,8 +661,6 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         super().__init__(cfg, env)
         self.is_rotating_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.is_linear_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.is_pure_vx_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.is_pure_vy_env = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
         # --- Build internal edge tensors ---
         # vx: [zero] + neg_bins + pos_bins
@@ -818,44 +803,25 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids_t, 1] = vy
         self.vel_command_b[env_ids_t, 2] = wz
 
-        # --- Mutually exclusive env type assignment ---
-        s = self.cfg.rel_standing_envs
-        pvx = self.cfg.rel_pure_vx_envs
-        pvy = self.cfg.rel_pure_vy_envs
-        r = self.cfg.rel_rotating_envs
-        # Remaining = joint (all axes active)
-        u = torch.rand(n, device=self.device)
-        self.is_standing_env[env_ids_t] = u < s
-        self.is_pure_vx_env[env_ids_t] = (u >= s) & (u < s + pvx)
-        self.is_pure_vy_env[env_ids_t] = (u >= s + pvx) & (u < s + pvx + pvy)
-        self.is_rotating_env[env_ids_t] = (u >= s + pvx + pvy) & (u < s + pvx + pvy + r)
-        self.is_linear_env[env_ids_t] = False  # deprecated
+        # --- Env type assignment ---
+        self.is_standing_env[env_ids_t] = torch.rand(n, device=self.device) <= self.cfg.rel_standing_envs
+        self.is_rotating_env[env_ids_t] = torch.rand(n, device=self.device) <= self.cfg.rel_rotating_envs
+        self.is_linear_env[env_ids_t] = torch.rand(n, device=self.device) <= self.cfg.rel_linear_envs
 
         # Route forced-zero axes to zero bins
         standing_local = self.is_standing_env[env_ids_t]
         rotating_local = self.is_rotating_env[env_ids_t]
-        pure_vx_local = self.is_pure_vx_env[env_ids_t]
-        pure_vy_local = self.is_pure_vy_env[env_ids_t]
+        linear_local = self.is_linear_env[env_ids_t]
 
-        # Standing: all -> zero
-        self._env_vx_bin[env_ids_t[standing_local]] = self._vx_zero_idx
+        # Standing & Rotating: vx->zero, vy->zero
+        force_zero_lin = standing_local | rotating_local
+        self._env_vx_bin[env_ids_t[force_zero_lin]] = self._vx_zero_idx
         if self._vy_zero_idx >= 0:
-            self._env_vy_bin[env_ids_t[standing_local]] = self._vy_zero_idx
-        self._env_wz_bin[env_ids_t[standing_local]] = self._wz_zero_idx
+            self._env_vy_bin[env_ids_t[force_zero_lin]] = self._vy_zero_idx
 
-        # Rotating (pure_wz): vx->zero, vy->zero
-        self._env_vx_bin[env_ids_t[rotating_local]] = self._vx_zero_idx
-        if self._vy_zero_idx >= 0:
-            self._env_vy_bin[env_ids_t[rotating_local]] = self._vy_zero_idx
-
-        # Pure_vx: vy->zero, wz->zero
-        if self._vy_zero_idx >= 0:
-            self._env_vy_bin[env_ids_t[pure_vx_local]] = self._vy_zero_idx
-        self._env_wz_bin[env_ids_t[pure_vx_local]] = self._wz_zero_idx
-
-        # Pure_vy: vx->zero, wz->zero
-        self._env_vx_bin[env_ids_t[pure_vy_local]] = self._vx_zero_idx
-        self._env_wz_bin[env_ids_t[pure_vy_local]] = self._wz_zero_idx
+        # Standing & Linear: wz->zero
+        force_zero_wz = standing_local | linear_local
+        self._env_wz_bin[env_ids_t[force_zero_wz]] = self._wz_zero_idx
 
         if self.cfg.heading_command:
             self.heading_target[env_ids_t] = torch.empty(n, device=self.device).uniform_(*self.cfg.ranges.heading)
@@ -881,44 +847,34 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         cmd_min = self.cfg.accuracy_cmd_min
         zero_thr = self.cfg.zero_speed_accuracy_threshold
 
-        # vx accuracy (direction-gated)
+        # vx accuracy
         cmd_vx_abs = cmd_vx.abs()
         has_vx = cmd_vx_abs >= cmd_min
-        min_resp = self.cfg.min_response_speed
-        vx_raw = torch.clamp(1.0 - (actual_vx - cmd_vx).abs() / cmd_vx_abs.clamp(min=cmd_min), min=0.0, max=1.0)
-        if min_resp > 0:
-            vx_raw = vx_raw * ((actual_vx * cmd_vx.sign()) > min_resp).float()
         vx_acc = torch.where(
             has_vx,
-            vx_raw,
+            torch.clamp(1.0 - (actual_vx - cmd_vx).abs() / cmd_vx_abs.clamp(min=cmd_min), min=0.0, max=1.0),
             torch.clamp(1.0 - actual_vx.abs() / zero_thr, min=0.0, max=1.0),
         )
         self._env_vx_acc_sum += vx_acc
         self._env_vx_acc_count += 1
 
-        # vy accuracy (direction-gated)
+        # vy accuracy
         cmd_vy_abs = cmd_vy.abs()
         has_vy = cmd_vy_abs >= cmd_min
-        vy_raw = torch.clamp(1.0 - (actual_vy - cmd_vy).abs() / cmd_vy_abs.clamp(min=cmd_min), min=0.0, max=1.0)
-        if min_resp > 0:
-            vy_raw = vy_raw * ((actual_vy * cmd_vy.sign()) > min_resp).float()
         vy_acc = torch.where(
             has_vy,
-            vy_raw,
+            torch.clamp(1.0 - (actual_vy - cmd_vy).abs() / cmd_vy_abs.clamp(min=cmd_min), min=0.0, max=1.0),
             torch.clamp(1.0 - actual_vy.abs() / zero_thr, min=0.0, max=1.0),
         )
         self._env_vy_acc_sum += vy_acc
         self._env_vy_acc_count += 1
 
-        # wz accuracy (direction-gated)
+        # wz accuracy
         cmd_wz_abs = cmd_wz.abs()
         has_wz = cmd_wz_abs >= cmd_min
-        wz_raw = torch.clamp(1.0 - (actual_wz - cmd_wz).abs() / cmd_wz_abs.clamp(min=cmd_min), min=0.0, max=1.0)
-        if min_resp > 0:
-            wz_raw = wz_raw * ((actual_wz * cmd_wz.sign()) > min_resp).float()
         wz_acc = torch.where(
             has_wz,
-            wz_raw,
+            torch.clamp(1.0 - (actual_wz - cmd_wz).abs() / cmd_wz_abs.clamp(min=cmd_min), min=0.0, max=1.0),
             torch.clamp(1.0 - actual_wz.abs() / zero_thr, min=0.0, max=1.0),
         )
         self._env_wz_acc_sum += wz_acc
@@ -961,10 +917,8 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         rotating = self.is_rotating_env[eids]
         linear = self.is_linear_env[eids]
 
-        # vx perf: only from pure_vx envs (no contamination from joint/rotating)
-        pure_vx = self.is_pure_vx_env[eids]
-        pure_vy = self.is_pure_vy_env[eids]
-        vx_mask = pure_vx
+        # vx perf: exclude standing & rotating (forced vx=0)
+        vx_mask = ~(standing | rotating)
         if vx_mask.sum() > 0:
             vx_eids = eids[vx_mask]
             vx_a = vx_acc[vx_mask]
@@ -974,8 +928,8 @@ class MarginalVelocityCommand(UniformVelocityCommand):
                 self._vx_perf[b] = (1.0 - alpha) * self._vx_perf[b] + alpha * vx_a[m].mean()
                 self._vx_update_count[b] += m.sum()
 
-        # vy perf: only from pure_vy envs (no contamination from joint/rotating)
-        vy_mask = pure_vy
+        # vy perf: exclude standing & rotating (forced vy=0)
+        vy_mask = ~(standing | rotating)
         if vy_mask.sum() > 0:
             vy_eids = eids[vy_mask]
             vy_a = vy_acc[vy_mask]
@@ -985,8 +939,8 @@ class MarginalVelocityCommand(UniformVelocityCommand):
                 self._vy_perf[b] = (1.0 - alpha) * self._vy_perf[b] + alpha * vy_a[m].mean()
                 self._vy_update_count[b] += m.sum()
 
-        # wz perf: only from rotating (pure_wz) envs
-        wz_mask = rotating
+        # wz perf: exclude standing & linear (forced wz=0)
+        wz_mask = ~(standing | linear)
         if wz_mask.sum() > 0:
             wz_eids = eids[wz_mask]
             wz_a = wz_acc[wz_mask]
