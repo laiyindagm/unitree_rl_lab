@@ -1,22 +1,17 @@
 """Contrastive Latent Policy (CLP) model.
 
 Dual-encoder (TCN / Transformer) → product-sphere projection → FiLM-conditioned
-observation residual prediction.  Integrates with rsl_rl MLPModel via ``get_latent()`` override.
+sequence prediction.  Integrates with rsl_rl MLPModel via ``get_latent()`` override.
 
-Key data flow (training, default history_len=10, pred_obs_dim=36):
-    flat_obs [B, 10×54]
-    → split: history_no_cmd [B, 10, 51], cmd [B, 3]
-    → Encoder(history_no_cmd) → h_enc [B, 96]   (3-layer dilated TCN, RF=15)
+Key data flow (training):
+    flat_obs [B, 5×54]
+    → split: history_no_cmd [B, 5, 51], cmd [B, 3], o_current [B, 51]
+    → Encoder(history_no_cmd) → h_enc [B, 96]
     → ProductSphereProjection(h_enc) → (z_x, z_y, z_w) each [B, 32]
     → z_cat = cat(z_x, z_y, z_w) [B, 96]
-    → FiLMGenerator(z_cat, cmd) → o_pred [B, 108]  (3×36 Δo residual on physical state only)
-    → latent = cat(flat_obs, gate*z_cat, gate*o_pred).detach()  [B, 744]
-    → MLP backbone [744 → 512 → 256 → 128] → distribution → action
-
-Prediction target = first 36 dims of history_no_cmd:
-    ang_vel(3) + gravity(3) + joint_pos(15) + joint_vel(15)
-    Excludes last_action(15) — it's the policy's own output, predicting it
-    would re-create the action-feedback loop. Excludes cmd (exogenous).
+    → FiLMGenerator(z_cat, cmd) → a_pred [B, 45]
+    → latent = cat(o_current, cmd, gate*z_cat, gate*a_pred).detach()  [B, 195]
+    → MLP backbone [195 → 512 → 256 → 128] → distribution → action
 """
 
 from __future__ import annotations
@@ -38,12 +33,12 @@ from rsl_rl.modules import HiddenState
 # ---------------------------------------------------------------------------
 
 class CausalConv1d(nn.Module):
-    """1-D causal convolution with left-padding (dilated)."""
+    """1-D causal convolution with left-padding."""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int = 1) -> None:
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int) -> None:
         super().__init__()
-        self.pad = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size, dilation=dilation)
+        self.pad = kernel_size - 1
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = F.pad(x, (self.pad, 0))
@@ -53,13 +48,13 @@ class CausalConv1d(nn.Module):
 class TCNBlock(nn.Module):
     """Residual TCN block: CausalConv → ELU → Dropout → CausalConv → ELU → + residual."""
 
-    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dilation: int = 1, dropout: float = 0.1) -> None:
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            CausalConv1d(in_ch, out_ch, kernel_size, dilation=dilation),
+            CausalConv1d(in_ch, out_ch, kernel_size),
             nn.ELU(),
             nn.Dropout(dropout),
-            CausalConv1d(out_ch, out_ch, kernel_size, dilation=dilation),
+            CausalConv1d(out_ch, out_ch, kernel_size),
             nn.ELU(),
         )
         self.residual = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
@@ -69,11 +64,10 @@ class TCNBlock(nn.Module):
 
 
 class TCNEncoder(nn.Module):
-    """Temporal Convolutional Network encoder with optional dilations.
+    """Temporal Convolutional Network encoder.
 
     Takes [B, T, D_obs] → [B, enc_dim].
-    With kernel=3, dilations=[1,2,4]: receptive field = 1 + 2*(1+2+4) = 15 (covers history_len=10).
-    With kernel=3, dilations=[1,2]:   receptive field = 1 + 2*(1+2)   = 7  (covers history_len=5).
+    2-layer TCN with kernel_size=3 gives receptive field = 5 = history_len.
     """
 
     def __init__(
@@ -81,20 +75,15 @@ class TCNEncoder(nn.Module):
         input_dim: int,
         channels: list[int] | None = None,
         kernel_size: int = 3,
-        dilations: list[int] | None = None,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         if channels is None:
-            channels = [64, 96, 96]
-        if dilations is None:
-            dilations = [2 ** i for i in range(len(channels))]
-        if len(dilations) != len(channels):
-            raise ValueError(f"len(dilations)={len(dilations)} != len(channels)={len(channels)}")
+            channels = [64, 96]
         layers: list[nn.Module] = []
         prev_ch = input_dim
-        for ch, d in zip(channels, dilations):
-            layers.append(TCNBlock(prev_ch, ch, kernel_size, dilation=d, dropout=dropout))
+        for ch in channels:
+            layers.append(TCNBlock(prev_ch, ch, kernel_size, dropout))
             prev_ch = ch
         self.network = nn.Sequential(*layers)
         self.output_dim = channels[-1]
@@ -110,14 +99,10 @@ class TCNEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CLPTransformerEncoder(nn.Module):
-    """Transformer-based history encoder for CLP, scaled for longer histories.
+    """Transformer-based history encoder for CLP.
 
-    Linear(D_obs → d_model) → LayerNorm → +pos_emb → causal TransformerEncoder
-    → LayerNorm → mean+last token pooling → Linear(2*d_model → enc_dim).
-
-    For history_len=10 the recommended setup is d_model=192, n_heads=4,
-    num_layers=3, dim_feedforward=384, dropout=0.1.  Mean+last pooling captures
-    both the long-range gait context and the most recent state.
+    Linear(D_obs → d_model) + pos_emb + causal TransformerEncoder + last token
+    + Linear(d_model → enc_dim).
     """
 
     def __init__(
@@ -125,17 +110,15 @@ class CLPTransformerEncoder(nn.Module):
         input_dim: int,
         history_len: int,
         enc_dim: int = 96,
-        d_model: int = 192,
+        d_model: int = 256,
         n_heads: int = 4,
-        num_layers: int = 3,
-        dim_feedforward: int = 384,
-        dropout: float = 0.1,
+        num_layers: int = 2,
+        dim_feedforward: int = 512,
     ) -> None:
         super().__init__()
         self.output_dim = enc_dim
         self.input_proj = nn.Linear(input_dim, d_model)
-        self.input_norm = nn.LayerNorm(d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, history_len, d_model) * 0.02)
+        self.pos_emb = nn.Parameter(torch.randn(1, history_len, d_model) * 0.1)
 
         causal_mask = torch.triu(
             torch.ones(history_len, history_len, dtype=torch.bool), diagonal=1
@@ -146,24 +129,17 @@ class CLPTransformerEncoder(nn.Module):
             d_model=d_model,
             nhead=n_heads,
             dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
             batch_first=True,
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.post_norm = nn.LayerNorm(d_model)
-        # Mean + last token pooling → 2 * d_model → enc_dim
-        self.output_proj = nn.Linear(2 * d_model, enc_dim)
+        self.output_proj = nn.Linear(d_model, enc_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: [B, T, D] → [B, enc_dim]."""
-        h = self.input_norm(self.input_proj(x)) + self.pos_emb
+        h = self.input_proj(x) + self.pos_emb
         h = self.encoder(h, mask=self.causal_mask)
-        h = self.post_norm(h)
-        last = h[:, -1, :]
-        mean = h.mean(dim=1)
-        return self.output_proj(torch.cat([mean, last], dim=-1))
+        return self.output_proj(h[:, -1, :])
 
 
 # ---------------------------------------------------------------------------
@@ -173,23 +149,20 @@ class CLPTransformerEncoder(nn.Module):
 class ProductSphereProjection(nn.Module):
     """Map encoder output to a product of unit hyperspheres.
 
-    Uses ``num_spheres`` INDEPENDENT linear heads enc_dim → sphere_dim, each
-    L2-normalised. Independent weights are required for P2 (the three sub-spheres
-    must live in different sub-spaces of the encoder output); a single shared
-    Linear → split would entangle them.
+    enc_dim → Linear → split into num_spheres × sphere_dim → L2-normalize each.
     """
 
     def __init__(self, enc_dim: int = 96, sphere_dim: int = 32, num_spheres: int = 3) -> None:
         super().__init__()
         self.sphere_dim = sphere_dim
         self.num_spheres = num_spheres
-        self.projs = nn.ModuleList(
-            [nn.Linear(enc_dim, sphere_dim) for _ in range(num_spheres)]
-        )
+        self.proj = nn.Linear(enc_dim, num_spheres * sphere_dim)
 
     def forward(self, h: torch.Tensor) -> list[torch.Tensor]:
         """h: [B, enc_dim] → list of num_spheres tensors [B, sphere_dim] on unit sphere."""
-        return [F.normalize(p(h), dim=-1) for p in self.projs]
+        raw = self.proj(h)
+        chunks = raw.split(self.sphere_dim, dim=-1)
+        return [F.normalize(c, dim=-1) for c in chunks]
 
 
 class ContrastiveProjector(nn.Module):
@@ -240,9 +213,9 @@ class FiLMLayer(nn.Module):
 
 
 class FiLMGenerator(nn.Module):
-    """FiLM-conditioned sequence prediction: (z_cat, e_c) → future obs residual predictions.
+    """FiLM-conditioned sequence prediction: (z_cat, e_c) → future action predictions.
 
-    Predicts pred_horizon steps × pred_dim observation deltas.
+    Predicts pred_horizon steps × num_actions actions.
     """
 
     def __init__(
@@ -250,14 +223,14 @@ class FiLMGenerator(nn.Module):
         enc_dim: int = 96,
         cond_dim: int = 3,
         pred_horizon: int = 3,
-        pred_dim: int = 51,
+        num_actions: int = 15,
     ) -> None:
         super().__init__()
         self.film = FiLMLayer(cond_dim=cond_dim, feat_dim=enc_dim)
         self.mlp = nn.Sequential(
             nn.Linear(enc_dim, 128),
             nn.ELU(),
-            nn.Linear(128, pred_horizon * pred_dim),
+            nn.Linear(128, pred_horizon * num_actions),
         )
 
     def forward(self, z_cat: torch.Tensor, e_c: torch.Tensor) -> torch.Tensor:
@@ -299,7 +272,6 @@ class ContrastiveLatentModel(MLPModel):
         # TCN params
         tcn_channels: list[int] | None = None,
         tcn_kernel_size: int = 3,
-        tcn_dilations: list[int] | None = None,
         # Transformer params
         tf_d_model: int = 256,
         tf_n_heads: int = 4,
@@ -307,7 +279,6 @@ class ContrastiveLatentModel(MLPModel):
         tf_dim_feedforward: int = 512,
         # Generator params
         pred_horizon: int = 3,
-        pred_obs_dim: int = 36,   # ang_vel(3) + gravity(3) + joint_pos(15) + joint_vel(15)
         num_actions: int = 15,
     ) -> None:
         # Store CLP config before super().__init__ (which calls _get_latent_dim)
@@ -320,21 +291,17 @@ class ContrastiveLatentModel(MLPModel):
         self.sphere_dim = sphere_dim
         self.num_spheres = num_spheres
         self.pred_horizon = pred_horizon
-        self.pred_obs_dim = pred_obs_dim
         self._num_actions = num_actions
-
-        if pred_obs_dim > history_obs_dim:
-            raise ValueError(f"pred_obs_dim ({pred_obs_dim}) cannot exceed history_obs_dim ({history_obs_dim})")
 
         # single_obs_dim = history_obs_dim + cmd_dim
         self.single_obs_dim = history_obs_dim + cmd_dim
 
-        # Compute latent dim: flat_obs + z_cat + o_pred (only physical-state subset)
-        self._pred_out_dim = pred_horizon * pred_obs_dim
+        # Compute latent dim: flat_obs + z_cat + a_pred
+        self._flat_obs_dim = history_len * (history_obs_dim + cmd_dim)  # 270
         self._latent_dim = (
-            history_len * (history_obs_dim + cmd_dim)  # flat_obs (e.g. 540)
-            + num_spheres * sphere_dim                 # z_cat (96)
-            + self._pred_out_dim                       # o_pred (e.g. 108)
+            self._flat_obs_dim           # flat_obs (270)
+            + num_spheres * sphere_dim   # z_cat (96)
+            + pred_horizon * num_actions # a_pred (45)
         )
 
         super().__init__(
@@ -346,9 +313,8 @@ class ContrastiveLatentModel(MLPModel):
         if encoder_type == "tcn":
             self.encoder = TCNEncoder(
                 input_dim=history_obs_dim,
-                channels=tcn_channels,
+                channels=tcn_channels or [64, 96],
                 kernel_size=tcn_kernel_size,
-                dilations=tcn_dilations,
             )
         elif encoder_type == "transformer":
             self.encoder = CLPTransformerEncoder(
@@ -381,15 +347,17 @@ class ContrastiveLatentModel(MLPModel):
             enc_dim=num_spheres * sphere_dim,
             cond_dim=cmd_dim,
             pred_horizon=pred_horizon,
-            pred_dim=pred_obs_dim,
+            num_actions=num_actions,
         )
 
-        # Gate value: set externally by PPO via iter schedule
-        self.gate_value = 0.0
+        # Learnable gate: starts at 0 so MLP initially sees [o_cur, cmd, 0, 0]
+        # (breaks chicken-and-egg: MLP can learn walking before encoder converges)
+        self.repr_gate = nn.Parameter(torch.tensor([-5.0]))  # sigmoid(-5)≈0.007
 
         # Cache for two-phase training
         self._cached_z_cat: torch.Tensor | None = None
-        self._cached_o_pred: torch.Tensor | None = None
+        self._cached_flat_obs: torch.Tensor | None = None
+        self._cached_a_pred: torch.Tensor | None = None
 
     def _get_latent_dim(self) -> int:
         return self._latent_dim
@@ -422,21 +390,19 @@ class ContrastiveLatentModel(MLPModel):
     # Public encode / project methods (used by ContrastivePPO)
     # ------------------------------------------------------------------
 
-    def encode(self, flat_obs: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
+    def encode(self, flat_obs: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
         """Full encoding for representation learning (Phase A).
 
-        Returns ``(z_spheres, raw_cmd)``. The cmd is extracted from the
-        UN-normalised flat_obs so that downstream quantisation against physical
-        velocity levels (e.g. vx_levels=[-0.8, ..., 1.5]) is meaningful.
-        Previously cmd was taken AFTER obs_normalizer, which z-scored the cmd
-        dims and broke quantisation when the running mean/std drifted.
+        Returns:
+            z_spheres: list of [B, sphere_dim] on unit spheres
+            cmd: [B, cmd_dim]
+            o_current: [B, history_obs_dim]
         """
-        raw_cmd = self.get_cmd_from_obs(flat_obs)            # P0: raw cmd for labels
-        flat_obs_n = self.obs_normalizer(flat_obs)
-        history_no_cmd, _, _ = self._split_obs(flat_obs_n)
+        flat_obs = self.obs_normalizer(flat_obs)
+        history_no_cmd, cmd, o_current = self._split_obs(flat_obs)
         h_enc = self.encoder(history_no_cmd)
         z_spheres = self.sphere_proj(h_enc)
-        return z_spheres, raw_cmd
+        return z_spheres, cmd, o_current
 
     def project_contrastive(self, z_spheres: list[torch.Tensor]) -> list[torch.Tensor]:
         """Apply training-only contrastive projectors."""
@@ -452,19 +418,20 @@ class ContrastiveLatentModel(MLPModel):
     # Cache interface for two-phase PPO
     # ------------------------------------------------------------------
 
-    def get_cached_repr(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (z_cat, o_pred) from the last get_latent() call."""
+    def get_cached_repr(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return representations from the last get_latent() call."""
         assert self._cached_z_cat is not None, "Call get_latent() first"
-        return self._cached_z_cat, self._cached_o_pred
+        return self._cached_z_cat, self._cached_cmd, self._cached_o_current, self._cached_a_pred
 
     @staticmethod
     def get_latent_from_cache(
-        flat_obs: torch.Tensor,
+        o_current: torch.Tensor,
+        cmd: torch.Tensor,
         z_cat: torch.Tensor,
-        o_pred: torch.Tensor,
+        a_pred: torch.Tensor,
     ) -> torch.Tensor:
         """Build the latent vector from cached components (Phase B)."""
-        return torch.cat([flat_obs, z_cat, o_pred], dim=-1)
+        return torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
 
     # ------------------------------------------------------------------
     # MLPModel override
@@ -481,22 +448,24 @@ class ContrastiveLatentModel(MLPModel):
         flat_obs = torch.cat(obs_list, dim=-1)
         flat_obs = self.obs_normalizer(flat_obs)
 
-        history_no_cmd, cmd, _ = self._split_obs(flat_obs)
+        history_no_cmd, cmd, o_current = self._split_obs(flat_obs)
 
         h_enc = self.encoder(history_no_cmd)
         z_spheres = self.sphere_proj(h_enc)
         z_cat = torch.cat(z_spheres, dim=-1)
 
-        o_pred = self.generator(z_cat, cmd)
+        a_pred = self.generator(z_cat, cmd)
 
         gate = self.gate_value
 
         # Cache for two-phase PPO (detached, gated)
         self._cached_z_cat = (gate * z_cat).detach()
-        self._cached_o_pred = (gate * o_pred).detach()
+        self._cached_cmd = cmd.detach()
+        self._cached_o_current = o_current.detach()
+        self._cached_a_pred = (gate * a_pred).detach()
 
         # Detach to block gradient from PPO into representation
-        return torch.cat([flat_obs, gate * z_cat, gate * o_pred], dim=-1).detach()
+        return torch.cat([o_current, cmd, gate * z_cat, gate * a_pred], dim=-1).detach()
 
     # ------------------------------------------------------------------
     # Phase B evaluation (bypass get_latent, use cached latent directly)
@@ -566,8 +535,8 @@ class _TorchCLPModel(nn.Module):
         h_enc = self.encoder(history_no_cmd)
         z_spheres = self.sphere_proj(h_enc)
         z_cat = torch.cat(z_spheres, dim=-1)
-        o_pred = self.generator(z_cat, cmd)
-        latent = torch.cat([x, z_cat, o_pred], dim=-1)
+        a_pred = self.generator(z_cat, cmd)
+        latent = torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
         out = self.mlp(latent)
         return self.deterministic_output(out)
 
@@ -616,8 +585,8 @@ class _OnnxCLPModel(nn.Module):
         h_enc = self.encoder(history_no_cmd)
         z_spheres = self.sphere_proj(h_enc)
         z_cat = torch.cat(z_spheres, dim=-1)
-        o_pred = self.generator(z_cat, cmd)
-        latent = torch.cat([x, z_cat, o_pred], dim=-1)
+        a_pred = self.generator(z_cat, cmd)
+        latent = torch.cat([o_current, cmd, z_cat, a_pred], dim=-1)
         out = self.mlp(latent)
         return self.deterministic_output(out)
 

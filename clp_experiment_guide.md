@@ -100,11 +100,7 @@ tensorboard --logdir logs/rsl_rl/ --bind_all
 
 ```bash
 # 完整配置（默认 gen_coef=0.5→0.1, nce_coef=0.1）
-/root/IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py \
-    --task Unitree-G1-15dof-Velocity-Rot-V19d-CLP \
-    --headless --num_envs 4096 \
-    --max_iterations 5000 \
-    --run_name E1_full_repr
+/root/IsaacLab/isaaclab.sh -p scripts/rsl_rl/train.py --task Unitree-G1-15dof-Velocity-Rot-V19d-CLP --headless --num_envs 4096 --max_iterations 5000 --run_name E1_full_repr
 ```
 
 ### 监控指标

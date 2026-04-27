@@ -965,3 +965,91 @@ def zero_cmd_body_vel(
     vel_ang = asset.data.root_ang_vel_b[:, 2].abs()
 
     return (vel_lin + vel_ang) * (cmd_norm < cmd_threshold)
+
+
+def pure_rotation_lin_drift(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    lin_threshold: float = 0.05,
+    yaw_threshold: float = 0.05,
+) -> torch.Tensor:
+    """Penalize linear velocity drift during pure rotation commands.
+
+    When commanded as pure rotation (cmd_lin~0, cmd_wz>threshold), penalize
+    actual linear velocity magnitude.  Specifically targets the "backward
+    push to rotate" cheating strategy.  Use with negative weight.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    is_pure_rotation = (torch.norm(cmd[:, :2], dim=1) < lin_threshold) & (cmd[:, 2].abs() > yaw_threshold)
+
+    actual_lin = env.scene["robot"].data.root_lin_vel_b[:, :2]
+    drift = torch.norm(actual_lin, dim=1)
+    return drift * is_pure_rotation.float()
+
+
+def zero_cmd_foot_height(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.1,
+) -> torch.Tensor:
+    """Penalize foot height when no command is active.
+
+    Geometric anti-stepping signal: when cmd_norm < threshold, sum the
+    z-position of every foot in body_ids.  Standing flat -> ~0; any foot
+    lift incurs immediate penalty proportional to lift height.
+
+    This complements zero_cmd_body_vel which can be cheated by symmetric
+    stepping (left+right cancel root velocity).  Use with negative weight.
+    """
+    asset: RigidObject = env.scene[asset_cfg.name]
+    foot_z = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    return foot_z.sum(dim=-1) * (cmd_norm < cmd_threshold).float()
+
+
+def zero_cmd_body_vel_scheduled(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.1,
+    start_step: int = 24000,
+    end_step: int = 72000,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Scheduled zero-cmd body velocity penalty.
+
+    Same as zero_cmd_body_vel but ramps weight 0 -> 1 between start_step and
+    end_step.  Allows the policy to learn locomotion fully before introducing
+    the standing constraint, preventing the "suicide policy" failure mode where
+    the agent terminates early to escape accumulated standing penalty.
+    """
+    progress = (env.common_step_counter - start_step) / max(end_step - start_step, 1)
+    schedule = max(0.0, min(progress, 1.0))
+    if schedule <= 0.0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    vel_lin = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    vel_ang = asset.data.root_ang_vel_b[:, 2].abs()
+    return schedule * (vel_lin + vel_ang) * (cmd_norm < cmd_threshold).float()
+
+
+def stand_still_scheduled(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    start_step: int = 24000,
+    end_step: int = 72000,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Scheduled stand_still: joint deviation penalty when cmd~0, ramped in."""
+    progress = (env.common_step_counter - start_step) / max(end_step - start_step, 1)
+    schedule = max(0.0, min(progress, 1.0))
+    if schedule <= 0.0:
+        return torch.zeros(env.num_envs, device=env.device)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    reward = torch.sum(torch.abs(asset.data.joint_pos - asset.data.default_joint_pos), dim=1)
+    cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
+    return schedule * reward * (cmd_norm < 0.1).float()
+

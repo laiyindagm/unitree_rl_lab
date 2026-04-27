@@ -725,26 +725,26 @@ gym.register(
 )
 
 
-# V19d-CLP: Contrastive Latent Policy (TCN encoder) on V19d env
+# V19d-CLP: Contrastive Latent Policy (TCN encoder) on V19d env (history_length=10)
 gym.register(
     id="Unitree-G1-15dof-Velocity-Rot-V19d-CLP",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfg",
-        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfgCLP",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfgCLP",
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofContrastiveTCNPPORunnerCfg",
     },
 )
 
-# V19d-CLP-Transformer: Contrastive Latent Policy (Transformer encoder) on V19d env
+# V19d-CLP-Transformer: Contrastive Latent Policy (Transformer encoder) on V19d env (history_length=10)
 gym.register(
     id="Unitree-G1-15dof-Velocity-Rot-V19d-CLP-Transformer",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfg",
-        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotEnvCfgCLP",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19d:RobotPlayEnvCfgCLP",
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofContrastiveTransformerPPORunnerCfg",
     },
 )
@@ -768,6 +768,254 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19f:RobotEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19g: "Balanced Rotation" — fix V19f backward-drift & vx/vy regression
+# init 必须要有play的注册
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19g",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19g:RobotEnvCfg",
+         "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19g:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19h: "Force Standing" — amplify standing signals + zero_cmd_foot_height
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19h",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19h:RobotEnvCfg",
+         "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19h:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V19i: "Scheduled Standing" — V19g base + scheduled zero_cmd penalties (24k->72k)
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V19i",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v19i:RobotEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# ---- V20: Mode-Token Locomotion ----
+
+# V20a: "5-Mode Token" — V19i base + 5-dim one-hot gait token observation
+# (standing/pure_vx/pure_vy/pure_wz/joint). Theoretical sample-complexity gain
+# Omega((Delta_x+Delta_y+Delta_w)^2/eps^2) over V19i. Clean A/B test.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20b: "Token + V19g" — clean A/B test of gait_mode_token without V19i schedule
+# pathology. V20a (Token + V19i) showed pre-collapse signature (bad_orient 23%,
+# entropy_loss +5.7) identical to V19i baseline → token did NOT help because
+# bottleneck is reward landscape, not observation. V20b reverts env to V19g
+# (last 18.7k-iter stable cfg) + token only.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20c: "Token + V19f" (REVISED 2026-04-25 after log audit).
+# V19 evolution facts (verified against logs/rsl_rl/):
+#   - V5c: only 13 aborted runs (max model_999 ~1k iter); NOT a verified base.
+#   - V19c-e: zero-speed instability ("robot still walks at cmd=0").
+#   - V19f (18.5k iter completed): "Zero-speed standing: FIXED" + "wz responds
+#     from 0.1: WORKING". Open issues: vx/vy 0.1-0.3 no response + pure-rotation
+#     backward drift — both map naturally to mode-token theoretical gains
+#     (pure_vx mode disambiguates parasitic vx; pure_wz mode allows drift-free
+#     rotation policy without adding new reward terms).
+#   - V19g: reverted V19f's lin-tracking skip → fixed drift but LOST zero-speed.
+#   - V19h/i: piled standing penalty → suicide policy, full collapse.
+# V19f is the ONLY V19 version satisfying: trained-to-completion + zero-speed-OK
+# + wz-responsive. V20c = V19f + gait_mode_token only (clean A/B isolation).
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20c",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20c:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20c:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20d: "V20c + Anti-Drift" — V19f-style pure_rotation_drift (-1.0) added on
+# top of V20c (V19f + token). Targets V20c sim2sim observation: pure rotation
+# drifts backward due to V19f's rotation_skip giving 1.0 reward for any drift.
+# Single-axis A/B vs V20c.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20d",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20d:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20d:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20e: "V20c + Sharp Linear Tracking" — track_lin_vel_xy_rotation_skip std
+# 0.5 -> 0.30. Targets V20c observation: error_vel_xy=0.50 m/s but
+# track_lin_vel_xy=0.81 (kernel too wide gives free reward). Sharp kernel
+# forces real tracking gradient. Single-axis A/B vs V20c.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20e",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20e:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20e:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20f: "V20c + Eliminate Rotation-Skip Blind Spot" — replaces V19f's
+# track_lin_vel_xy_rotation_skip with standard track_lin_vel_xy_yaw_frame_exp.
+# Targets V20d sim2sim observation: pure_rotation_drift (-1.0) too weak vs
+# +1.0 free reward from skip; half-rotation accumulates 1m drift. Single-axis
+# A/B vs V20c. User insight: tracking success must check zero-commanded axes
+# remain zero, which rotation_skip violates by construction.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20f",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20f:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20f:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20g: "V20f + Eliminate wz Skip Blind Spot" — replaces V19f's
+# track_ang_vel_z_rotating_aware (skips on straight walk) with standard
+# track_ang_vel_z_exp for both main and sharp wz trackers. Same weight/std.
+# Targets V20f sim2sim observation: pure vx/vy staggers, but adding a small
+# wz cmd makes walking smooth -- direct evidence of wz blind spot. Mirror
+# fix to V20f's lin-side fix. Sequential A/B vs V20f.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20g",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20g:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20g:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20h: "V20f + Boost Pure-Linear Sampling" — increases rel_pure_vx_envs and
+# rel_pure_vy_envs from 0.15 to 0.25 each (joint envs reduced 0.35 -> 0.15).
+# All rewards/bins/std/weights unchanged. Parallel single-axis A/B vs V20f.
+# Targets V20f sim2sim correction: pure_vx/pure_vy token branches fail
+# while any 2+ axis combo works -- tests data-density hypothesis vs
+# V20g's reward-landscape hypothesis.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20h",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20h:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20h:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20i: "V20f without gait_mode_token" — removes the 5-dim one-hot mode
+# token from observations, reverting to V19f-style obs. Keeps V20f's
+# linear-side rotation_skip removal. Tests the deepest hypothesis: token
+# enforces per-mode subpolicy specialization that prevents transfer of
+# yaw-control skill from joint-mode envs (which see cmd_wz!=0) to
+# pure-linear-mode envs (which never see cmd_wz signal due to skip+
+# proportional structure). Single-axis A/B vs V20f. User insight:
+# data-density boost (V20h) cannot help when per-sample gradient is zero.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20i",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20i:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20i:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20j: "V20f + 3-mode token (standing|pure_wz|other)" — selective
+# isolation. Keeps token routing for {standing, pure_wz} (qualitatively
+# distinct objectives benefit from dedicated subpolicies) but collapses
+# {pure_vx, pure_vy, joint} into one "other" bucket so joint envs'
+# cmd_wz!=0 yaw signal can transfer (via shared subpolicy params) to
+# pure_vx/pure_vy samples. Single-axis A/B vs V20f. Complements V20i:
+# V20j tests "selective isolation"; V20i tests "no isolation". User
+# insight: isolation must be necessary; full 5-way over-isolates.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20j",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20j:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20j:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20k: "V20i + Symmetric wz Tracking" — single-variable fix targeting
+# the reward-structure asymmetry that drives the yaw-wobble cheat.
+# Replaces both track_ang_vel_z_rotating_aware terms with the standard
+# track_ang_vel_z_exp (kills wz SKIP at cmd_yaw<0.05). cmd_yaw=0 envs
+# now experience strict tracking on BOTH axes — destroying the
+# wobble-yaw-to-fake-v_xy local optimum at its source. No token (V20i
+# inheritance). Predictions: waist_roll_vel > -0.05, error_vel_yaw <
+# 0.30, bad_orient < 1%. If standing still bad → V20k-r2 adds 2-mode
+# token. If wobble persists → wz_proportional weight escalation.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20k",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20k:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20k:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
+    },
+)
+
+# V20l: "V20g + 3-mode token" — keeps mandatory isolation
+# {standing, pure_wz, other}, but fixes the pure_xy training environment by
+# inheriting V20g's standard track_ang_vel_z_exp rewards (no straight-walk wz
+# skip). Compared with V20j, only yaw reward changes; compared with V20g, only
+# token granularity changes (5-mode -> 3-mode). Tests whether pure_xy fails
+# because cmd_wz==0 samples lacked yaw supervision, not because token exists.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V20l",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20l:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v20l:RobotPlayEnvCfg",
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:BasePPORunnerV3Cfg",
     },
 )

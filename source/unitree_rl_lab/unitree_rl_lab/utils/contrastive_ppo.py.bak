@@ -1,11 +1,11 @@
 """Contrastive Latent Policy PPO — two-phase update with factored InfoNCE.
 
 Phase A (representation): Re-encode observations, compute factored InfoNCE loss
-over product spheres and FiLM-conditioned observation residual prediction loss.  Optimised by
+over product spheres and FiLM-conditioned sequence prediction loss.  Optimised by
 a dedicated ``repr_optimizer``.
 
-Phase B (policy): Use rollout-cached representations (z_cat, o_pred)
-combined with flat_obs to build latent vectors for the MLP policy head.  Standard PPO
+Phase B (policy): Use rollout-cached representations (z_cat, cmd, a_pred,
+o_current) to build latent vectors for the MLP policy head.  Standard PPO
 surrogate + value + entropy, optimised by the inherited ``self.optimizer``.
 """
 
@@ -39,7 +39,7 @@ _NCE_MAX_SAMPLES = 2048 * 2  # cap to avoid O(B^2) blowup
 def factored_infonce(
     projections: list[torch.Tensor],
     labels_per_sphere: list[torch.Tensor],
-    temperature: float | torch.Tensor,
+    temperature: float,
 ) -> torch.Tensor:
     """Factored SupCon-style InfoNCE over independent spheres.
 
@@ -82,78 +82,30 @@ def factored_infonce(
     return total / len(projections)
 
 
-def time_infonce(
-    p_anchors: list[torch.Tensor],
-    p_positives: list[torch.Tensor],
-    valid_mask: torch.Tensor,
-    temperature: float | torch.Tensor,
-) -> torch.Tensor:
-    """SimCLR-style NT-Xent over time-shifted positive pairs.
-
-    Each anchor i has exactly one positive (the same env at t+k_shift).
-    All other 2B-2 entries (other anchors and other positives) are negatives.
-    Operates per sphere then averages.
-
-    Args:
-        p_anchors: list of [B, D] L2-normalised anchor projections, one per sphere.
-        p_positives: list of [B, D] L2-normalised positive projections (time-shifted).
-        valid_mask: [B] boolean mask — True where the (anchor, positive) pair is valid
-            (no episode termination between t and t+k_shift).
-        temperature: softmax temperature.
-
-    Returns:
-        Scalar mean loss; zero tensor if fewer than 4 valid pairs.
-    """
-    valid = valid_mask
-    if valid.sum().item() < 4:
-        return torch.tensor(0.0, device=p_anchors[0].device)
-
-    # Subsample if very large to keep O(B^2) tractable
-    valid_idx = valid.nonzero(as_tuple=False).squeeze(-1)
-    if valid_idx.numel() > _NCE_MAX_SAMPLES:
-        perm = torch.randperm(valid_idx.numel(), device=valid_idx.device)[:_NCE_MAX_SAMPLES]
-        valid_idx = valid_idx[perm]
-
-    total = torch.tensor(0.0, device=p_anchors[0].device)
-    for pa, pp in zip(p_anchors, p_positives):
-        a = pa[valid_idx]
-        b = pp[valid_idx]
-        B = a.shape[0]
-        z = torch.cat([a, b], dim=0)                         # [2B, D]
-        sim = (z @ z.t()) / temperature                      # [2B, 2B]
-        sim.fill_diagonal_(-1e9)
-        # positive index: i (in 0..B-1) ↔ i+B (in B..2B-1) and vice versa
-        targets = torch.arange(2 * B, device=z.device)
-        targets = (targets + B) % (2 * B)
-        loss = F.cross_entropy(sim, targets)
-        total = total + loss
-    return total / len(p_anchors)
-
-
 def sequence_prediction_loss(
-    pred: torch.Tensor,
+    a_pred: torch.Tensor,
     future_gt: torch.Tensor,
     future_mask: torch.Tensor,
     gamma: float = 0.9,
 ) -> torch.Tensor:
-    """Time-decayed MSE for future sequence prediction.
+    """Time-decayed MSE for future action prediction.
 
     Args:
-        pred: [B, K*D] predicted future values (obs deltas or actions).
-        future_gt: [B, K*D] ground-truth future values.
+        a_pred: [B, K*num_actions] predicted future actions.
+        future_gt: [B, K*num_actions] ground-truth future actions.
         future_mask: [B, K] boolean mask (True = valid).
         gamma: temporal discount factor.
     """
     K = future_mask.shape[1]
-    D = pred.shape[1] // K
+    num_actions = a_pred.shape[1] // K
 
-    pred_steps = pred.view(-1, K, D)
-    gt_steps = future_gt.view(-1, K, D)
+    pred_steps = a_pred.view(-1, K, num_actions)
+    gt_steps = future_gt.view(-1, K, num_actions)
 
     mse = (pred_steps - gt_steps).pow(2).mean(dim=-1)  # [B, K]
 
     weights = torch.tensor(
-        [gamma ** k for k in range(K)], device=pred.device, dtype=pred.dtype
+        [gamma ** k for k in range(K)], device=a_pred.device, dtype=a_pred.dtype
     )
 
     masked_mse = mse * future_mask.float() * weights.unsqueeze(0)
@@ -161,7 +113,7 @@ def sequence_prediction_loss(
 
     if valid_count > 0:
         return masked_mse.sum() / valid_count
-    return torch.tensor(0.0, device=pred.device)
+    return torch.tensor(0.0, device=a_pred.device)
 
 
 _METRIC_SUBSAMPLE = 512  # cap to avoid O(B^2) blowup on large batches
@@ -212,11 +164,6 @@ class ContrastivePPO(PPO):
         storage: RolloutStorage,
         *,
         nce_coef: float = 0.1,
-        time_nce_coef: float = 0.0,        # B: SimCLR time-positive InfoNCE weight
-        time_shift: int = 4,               # B: positive pair offset in env steps
-        use_achieved_labels: bool = False, # X: label by achieved velocity (from critic obs) instead of cmd
-        achieved_obs_key: str = "critic",  # X: which obs group holds base_lin_vel + base_ang_vel
-        achieved_ang_vel_scale: float = 0.2,  # X: critic obs scale on base_ang_vel; we undo it
         gen_coef: float = 0.5,
         gen_coef_end: float = 0.1,
         gen_decay_iters: int = 10000,
@@ -225,7 +172,6 @@ class ContrastivePPO(PPO):
         repr_lr: float = 1e-4,
         pred_gamma: float = 0.9,
         warmup_iters: int = 0,
-        gate_open_iters: int = 1000,
         vx_levels: list[float] | None = None,
         vy_levels: list[float] | None = None,
         wz_levels: list[float] | None = None,
@@ -236,11 +182,6 @@ class ContrastivePPO(PPO):
         self.warmup_iters = warmup_iters
         self.gate_open_iters = gate_open_iters
         self.nce_coef = nce_coef
-        self.time_nce_coef = time_nce_coef
-        self.time_shift = int(time_shift)
-        self.use_achieved_labels = bool(use_achieved_labels)
-        self.achieved_obs_key = str(achieved_obs_key)
-        self.achieved_ang_vel_scale = float(achieved_ang_vel_scale)
         self.gen_coef_start = gen_coef
         self.gen_coef_end = gen_coef_end
         self.gen_decay_iters = gen_decay_iters
@@ -259,9 +200,6 @@ class ContrastivePPO(PPO):
         default_vx = [-0.8, -0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0, 1.2, 1.5]
         default_vy = [-0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3]
         default_wz = [-0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5]
-        # default_vx = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,1.1, 1.2, 1.3, 1.4, 1.5]
-        # default_vy = [-0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5]
-        # default_wz = [-0.8, -0.7, -0.6, -0.5, -0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
         self.vx_levels = torch.tensor(vx_levels or default_vx, dtype=torch.float32, device=self.device)
         self.vy_levels = torch.tensor(vy_levels or default_vy, dtype=torch.float32, device=self.device)
         self.wz_levels = torch.tensor(wz_levels or default_wz, dtype=torch.float32, device=self.device)
@@ -290,8 +228,11 @@ class ContrastivePPO(PPO):
         num_spheres = actor.num_spheres
         sphere_dim = actor.sphere_dim
         pred_horizon = actor.pred_horizon
+        num_actions = actor._num_actions
         storage.cached_z_cat = torch.zeros(T, N, num_spheres * sphere_dim, device=self.device)
-        storage.cached_o_pred = torch.zeros(T, N, actor._pred_out_dim, device=self.device)
+        storage.cached_cmd = torch.zeros(T, N, actor.cmd_dim, device=self.device)
+        storage.cached_o_current = torch.zeros(T, N, actor.history_obs_dim, device=self.device)
+        storage.cached_a_pred = torch.zeros(T, N, pred_horizon * num_actions, device=self.device)
 
     # ------------------------------------------------------------------
     # Coefficient schedules
@@ -315,101 +256,51 @@ class ContrastivePPO(PPO):
         # Update gate schedule before each rollout step
         self.actor.gate_value = min(self.counter / self.gate_open_iters, 1.0)
         actions = super().act(obs)
-        z_cat, o_pred = self.actor.get_cached_repr()
+        z_cat, cmd_cached, o_current_cached, a_pred = self.actor.get_cached_repr()
         step = self.storage.step  # act() runs BEFORE add_transition
         self.storage.cached_z_cat[step] = z_cat
-        self.storage.cached_o_pred[step] = o_pred
+        self.storage.cached_cmd[step] = cmd_cached
+        self.storage.cached_o_current[step] = o_current_cached
+        self.storage.cached_a_pred[step] = a_pred
         return actions
 
     # ------------------------------------------------------------------
     # Build future action ground truth from storage
     # ------------------------------------------------------------------
 
-    def _build_future_obs_deltas(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build future observation-delta targets and validity mask.
-
-        Computes Δo[t, k] = o_current[t+k+1] - o_current[t] where o_current is
-        the last frame's observation without cmd (history_obs_dim=51).
+    def _build_future_actions(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build future action targets and validity mask from rollout actions.
 
         Returns:
-            future_obs: [T, N, K*history_obs_dim]
+            future_actions: [T, N, K*num_actions]
             future_mask: [T, N, K] boolean
         """
         T = self.storage.num_transitions_per_env
         N = self.storage.num_envs
         K = self.actor.pred_horizon
-        pred_dim = self.actor.pred_obs_dim  # 36 (ang_vel + gravity + joint_pos + joint_vel)
-        cs = self.actor.cmd_start_idx
-        cd = self.actor.cmd_dim
+        num_actions = self.actor._num_actions
 
-        # Extract flat obs for all T steps: [T, N, history_len * single_obs_dim]
-        all_flat_obs = torch.cat(
-            [self.storage.observations[k] for k in self.actor.obs_groups], dim=-1
-        )  # [T, N, history_len*54]
-
-        # Extract o_current (last frame, no cmd) for all steps
-        frames = all_flat_obs.view(T, N, self.actor.history_len, self.actor.single_obs_dim)
-        last_frame = frames[:, :, -1, :]  # [T, N, 54]
-        # history_no_cmd layout: [ang_vel(3), gravity(3), joint_pos(15), joint_vel(15), last_action(15)] = 51
-        # Take only the first pred_dim dims (physical state, excludes last_action)
-        o_pred_target = torch.cat(
-            [last_frame[:, :, :cs], last_frame[:, :, cs + cd:]], dim=-1
-        )[:, :, :pred_dim]  # [T, N, pred_dim]
-
-        future_obs = torch.zeros(T, N, K * pred_dim, device=self.device)
+        future_actions = torch.zeros(T, N, K * num_actions, device=self.device)
         future_mask = torch.zeros(T, N, K, dtype=torch.bool, device=self.device)
 
-        dones = self.storage.dones.squeeze(-1)  # [T, N]
-        not_done = ~dones.bool()
+        actions = self.storage.actions  # [T, N, num_actions]
+        dones = self.storage.dones.squeeze(-1)  # [T, N] (storage keeps [T, N, 1])
+        not_done = ~dones.bool()  # [T, N]
 
         for k in range(K):
+            # future_t = t + k + 1, so valid range: t in [0, T-k-2]
             t_end = T - k - 1
             if t_end <= 0:
                 break
-            # Δo: observation at t+k+1 minus observation at t (physical state only)
-            delta = o_pred_target[k + 1 : k + 1 + t_end] - o_pred_target[:t_end]
-            future_obs[:t_end, :, k * pred_dim : (k + 1) * pred_dim] = delta
-            # Mask: no done in [t, t+k+1)
+            # Copy actions: for step t, future action at offset k is actions[t+k]
+            future_actions[:t_end, :, k * num_actions : (k + 1) * num_actions] = actions[k:k + t_end]
+            # Mask: no done in [t, t+k+1) → all not_done[t], not_done[t+1], ..., not_done[t+k]
             valid = torch.ones(t_end, N, dtype=torch.bool, device=self.device)
             for j in range(k + 1):
-                valid = valid & not_done[j : j + t_end]
+                valid = valid & not_done[j:j + t_end]
             future_mask[:t_end, :, k] = valid
 
-        return future_obs, future_mask
-
-    # ------------------------------------------------------------------
-    # B: Time-shifted positive pair obs
-    # ------------------------------------------------------------------
-
-    def _build_time_pair_obs(self, k_shift: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build time-shifted positive observation tensor and validity mask.
-
-        For each (t, n) the positive is the obs at (t+k_shift, n), valid only if
-        no episode termination occurred in [t, t+k_shift).
-
-        Returns:
-            pair_obs: [T*N, total_obs_dim] flattened
-            pair_mask: [T*N] boolean
-        """
-        T = self.storage.num_transitions_per_env
-        N = self.storage.num_envs
-        all_flat = torch.cat(
-            [self.storage.observations[k] for k in self.actor.obs_groups], dim=-1
-        )  # [T, N, D]
-        D = all_flat.shape[-1]
-        pair_obs = torch.zeros_like(all_flat)
-        pair_mask = torch.zeros(T, N, dtype=torch.bool, device=self.device)
-
-        if k_shift > 0 and T - k_shift > 0:
-            pair_obs[: T - k_shift] = all_flat[k_shift:]
-            dones = self.storage.dones.squeeze(-1).bool()        # [T, N]
-            not_done = ~dones
-            valid = torch.ones(T - k_shift, N, dtype=torch.bool, device=self.device)
-            for j in range(k_shift):
-                valid = valid & not_done[j : j + (T - k_shift)]
-            pair_mask[: T - k_shift] = valid
-
-        return pair_obs.flatten(0, 1), pair_mask.flatten(0, 1)
+        return future_actions, future_mask
 
     # ------------------------------------------------------------------
     # Flatten obs helper
@@ -430,83 +321,15 @@ class ContrastivePPO(PPO):
         T = self.storage.num_transitions_per_env
         N = self.storage.num_envs
 
-        # Build future observation delta ground truth
-        future_obs_deltas, future_mask = self._build_future_obs_deltas()
-
-        # B: build time-shifted positive obs (no-op if time_nce_coef==0)
-        if self.time_nce_coef > 0.0:
-            flat_pair_obs, flat_pair_mask = self._build_time_pair_obs(self.time_shift)
-        else:
-            flat_pair_obs = None
-            flat_pair_mask = None
-
-        # C: label distribution probe — one-shot per update on full storage cmd
-        with torch.no_grad():
-            all_obs_flat_full = torch.cat(
-                [self.storage.observations[k] for k in self.actor.obs_groups], dim=-1
-            )  # [T, N, D]
-            frames_full = all_obs_flat_full.view(
-                T, N, self.actor.history_len, self.actor.single_obs_dim
-            )
-            cs_full = self.actor.cmd_start_idx
-            cd_full = self.actor.cmd_dim
-            cmd_full = frames_full[:, :, -1, cs_full : cs_full + cd_full].reshape(-1, cd_full)
-            lbl_full_x = quantize_to_levels(cmd_full[:, 0], self.vx_levels)
-            lbl_full_y = quantize_to_levels(cmd_full[:, 1], self.vy_levels)
-            lbl_full_w = quantize_to_levels(cmd_full[:, 2], self.wz_levels)
-
-            def _lbl_stats(lbl: torch.Tensor, n_bins: int) -> tuple[float, float]:
-                cnt = torch.bincount(lbl, minlength=n_bins).float()
-                tot = cnt.sum().clamp(min=1.0)
-                uniq = (cnt > 0).sum().item()
-                top1 = (cnt.max() / tot).item()
-                return float(uniq), float(top1)
-
-            lbl_uniq_x, lbl_top1_x = _lbl_stats(lbl_full_x, len(self.vx_levels))
-            lbl_uniq_y, lbl_top1_y = _lbl_stats(lbl_full_y, len(self.vy_levels))
-            lbl_uniq_w, lbl_top1_w = _lbl_stats(lbl_full_w, len(self.wz_levels))
-
-        # X: build per-step achieved velocity tensor (label source) from critic obs.
-        # achieved = [base_lin_vel_x, base_lin_vel_y, base_ang_vel_z * 1/scale]
-        # Critic single-frame layout (V19d, 57 dims): base_lin_vel(3), base_ang_vel(3),
-        # grav(3), cmd(3), jpos(15), jvel(15), last_action(15).
-        # base_ang_vel is z-scored only by EmpiricalNormalization later; here it's raw
-        # times the static cfg scale (0.2). We undo that scale to recover physical rad/s.
-        if self.use_achieved_labels:
-            critic_flat = self.storage.observations[self.achieved_obs_key]  # [T, N, hl*57]
-            T_c, N_c = critic_flat.shape[0], critic_flat.shape[1]
-            crit_total = critic_flat.shape[-1]
-            # Infer single-frame dim: history_len shared with policy
-            crit_single = crit_total // self.actor.history_len
-            critic_frames = critic_flat.view(T_c, N_c, self.actor.history_len, crit_single)
-            last_critic = critic_frames[:, :, -1, :]  # [T, N, crit_single]
-            inv_ang_scale = 1.0 / max(self.achieved_ang_vel_scale, 1e-6)
-            achieved_full = torch.stack(
-                [
-                    last_critic[:, :, 0],                   # base_lin_vel_x  (raw m/s)
-                    last_critic[:, :, 1],                   # base_lin_vel_y
-                    last_critic[:, :, 5] * inv_ang_scale,   # base_ang_vel_z (un-scaled)
-                ],
-                dim=-1,
-            )  # [T, N, 3]
-            flat_achieved = achieved_full.flatten(0, 1)  # [T*N, 3]
-
-            # Probe achieved-label distribution too
-            with torch.no_grad():
-                ach_lbl_x = quantize_to_levels(flat_achieved[:, 0], self.vx_levels)
-                ach_lbl_y = quantize_to_levels(flat_achieved[:, 1], self.vy_levels)
-                ach_lbl_w = quantize_to_levels(flat_achieved[:, 2], self.wz_levels)
-                ach_uniq_x, ach_top1_x = _lbl_stats(ach_lbl_x, len(self.vx_levels))
-                ach_uniq_y, ach_top1_y = _lbl_stats(ach_lbl_y, len(self.vy_levels))
-                ach_uniq_w, ach_top1_w = _lbl_stats(ach_lbl_w, len(self.wz_levels))
-        else:
-            flat_achieved = None
-            ach_uniq_x = ach_top1_x = ach_uniq_y = ach_top1_y = ach_uniq_w = ach_top1_w = 0.0
+        # Build future action ground truth
+        future_actions, future_mask = self._build_future_actions()
 
         # Flatten cached buffers: [T, N, ...] → [T*N, ...]
         flat_cached_z = self.storage.cached_z_cat.flatten(0, 1)
-        flat_cached_o_pred = self.storage.cached_o_pred.flatten(0, 1)
-        flat_future_obs = future_obs_deltas.flatten(0, 1)
+        flat_cached_cmd = self.storage.cached_cmd.flatten(0, 1)
+        flat_cached_ocur = self.storage.cached_o_current.flatten(0, 1)
+        flat_cached_apred = self.storage.cached_a_pred.flatten(0, 1)
+        flat_future_actions = future_actions.flatten(0, 1)
         flat_future_mask = future_mask.flatten(0, 1)
 
         # Flatten standard storage for PPO
@@ -528,7 +351,6 @@ class ContrastivePPO(PPO):
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
         mean_nce_loss = 0.0
-        mean_time_nce_loss = 0.0
         mean_gen_loss = 0.0
         mean_repr_loss = 0.0
         uniformity_sums = [0.0] * self.actor.num_spheres
@@ -555,8 +377,10 @@ class ContrastivePPO(PPO):
                 batch_old_dist_params = tuple(p[batch_idx] for p in old_distribution_params)
 
                 batch_z_cat = flat_cached_z[batch_idx]
-                batch_o_pred = flat_cached_o_pred[batch_idx]
-                batch_future = flat_future_obs[batch_idx]
+                batch_cmd = flat_cached_cmd[batch_idx]
+                batch_ocur = flat_cached_ocur[batch_idx]
+                batch_a_pred = flat_cached_apred[batch_idx]
+                batch_future = flat_future_actions[batch_idx]
                 batch_future_mask = flat_future_mask[batch_idx]
 
                 if self.normalize_advantage_per_mini_batch:
@@ -567,52 +391,25 @@ class ContrastivePPO(PPO):
 
                 # ====== Phase A: Representation Learning ======
                 flat_obs_a = self._flatten_obs(batch_obs)
-                z_spheres, cmd = self.actor.encode(flat_obs_a)
+                z_spheres, cmd, _ = self.actor.encode(flat_obs_a)
                 p_spheres = self.actor.project_contrastive(z_spheres)
 
-                # X: prefer achieved velocity over cmd for SupCon labels when enabled.
-                # Achieved is what the encoder *can actually see* in history; cmd may be
-                # un-realisable when curriculum is stuck (e.g. cmd_x=1.5 but robot
-                # only walks at 0.13 m/s) → SupCon target becomes unsatisfiable.
-                if flat_achieved is not None:
-                    label_src = flat_achieved[batch_idx]
-                else:
-                    label_src = cmd
                 labels_per_sphere = [
-                    quantize_to_levels(label_src[:, 0], self.vx_levels),
-                    quantize_to_levels(label_src[:, 1], self.vy_levels),
-                    quantize_to_levels(label_src[:, 2], self.wz_levels),
+                    quantize_to_levels(cmd[:, 0], self.vx_levels),
+                    quantize_to_levels(cmd[:, 1], self.vy_levels),
+                    quantize_to_levels(cmd[:, 2], self.wz_levels),
                 ]
 
                 tau_val = self.tau.clamp(min=0.01, max=2.0)
-                nce_loss = factored_infonce(p_spheres, labels_per_sphere, tau_val)
-
-                # B: time-shifted positive InfoNCE (SimCLR style)
-                if self.time_nce_coef > 0.0 and flat_pair_obs is not None:
-                    batch_pair_obs = flat_pair_obs[batch_idx]
-                    batch_pair_mask = flat_pair_mask[batch_idx]
-                    if batch_pair_mask.any():
-                        z_pos_spheres, _ = self.actor.encode(batch_pair_obs)
-                        p_pos_spheres = self.actor.project_contrastive(z_pos_spheres)
-                        time_nce_loss = time_infonce(
-                            p_spheres, p_pos_spheres, batch_pair_mask, tau_val
-                        )
-                    else:
-                        time_nce_loss = torch.tensor(0.0, device=self.device)
-                else:
-                    time_nce_loss = torch.tensor(0.0, device=self.device)
+                nce_loss = factored_infonce(p_spheres, labels_per_sphere, tau_val.item())
 
                 z_cat_a = torch.cat(z_spheres, dim=-1)
-                o_pred_a = self.actor.generator(z_cat_a, cmd)
+                a_pred_a = self.actor.generator(z_cat_a, cmd)
                 gen_loss = sequence_prediction_loss(
-                    o_pred_a, batch_future, batch_future_mask, self.pred_gamma
+                    a_pred_a, batch_future, batch_future_mask, self.pred_gamma
                 )
 
-                repr_loss = (
-                    self.nce_coef * nce_loss
-                    + self.time_nce_coef * time_nce_loss
-                    + gen_coef * gen_loss
-                )
+                repr_loss = self.nce_coef * nce_loss + gen_coef * gen_loss
 
                 self.repr_optimizer.zero_grad()
                 repr_loss.backward()
@@ -632,18 +429,16 @@ class ContrastivePPO(PPO):
                     # Warmup: re-encode with gradients so PPO can train encoder
                     flat_obs_b = self._flatten_obs(batch_obs)
                     flat_obs_b = self.actor.obs_normalizer(flat_obs_b)
-                    h_nc, cmd_b, _ = self.actor._split_obs(flat_obs_b)
+                    h_nc, cmd_b, o_cur_b = self.actor._split_obs(flat_obs_b)
                     h_enc_b = self.actor.encoder(h_nc)
                     z_sph_b = self.actor.sphere_proj(h_enc_b)
                     z_cat_b = torch.cat(z_sph_b, dim=-1)
-                    o_pred_b = self.actor.generator(z_cat_b, cmd_b)
+                    a_pred_b = self.actor.generator(z_cat_b, cmd_b)
                     gate = min(self.counter / self.gate_open_iters, 1.0)
-                    latent = torch.cat([flat_obs_b, gate * z_cat_b, gate * o_pred_b], dim=-1)
+                    latent = torch.cat([o_cur_b, cmd_b, gate * z_cat_b, gate * a_pred_b], dim=-1)
                 else:
-                    batch_flat_obs = self._flatten_obs(batch_obs)
-                    batch_flat_obs = self.actor.obs_normalizer(batch_flat_obs)
                     latent = ContrastiveLatentModel.get_latent_from_cache(
-                        batch_flat_obs, batch_z_cat, batch_o_pred
+                        batch_ocur, batch_cmd, batch_z_cat, batch_a_pred
                     )
 
                 self.actor.evaluate_from_latent(latent, stochastic_output=True)
@@ -701,7 +496,6 @@ class ContrastivePPO(PPO):
                 mean_surrogate_loss += surrogate_loss.item()
                 mean_entropy += entropy.mean().item()
                 mean_nce_loss += nce_loss.item()
-                mean_time_nce_loss += time_nce_loss.item()
                 mean_gen_loss += gen_loss.item()
                 mean_repr_loss += repr_loss.item()
 
@@ -710,7 +504,6 @@ class ContrastivePPO(PPO):
         mean_surrogate_loss /= num_updates
         mean_entropy /= num_updates
         mean_nce_loss /= num_updates
-        mean_time_nce_loss /= num_updates
         mean_gen_loss /= num_updates
         mean_repr_loss /= num_updates
         for s_idx in range(self.actor.num_spheres):
@@ -725,27 +518,12 @@ class ContrastivePPO(PPO):
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
             "nce_loss": mean_nce_loss,
-            "time_nce_loss": mean_time_nce_loss,
             "gen_loss": mean_gen_loss,
             "repr_loss": mean_repr_loss,
             "gen_coef": gen_coef,
             "tau": self.tau.item(),
             "warmup": float(self.counter < self.warmup_iters),
             "gate": self.actor.gate_value,
-            # C: label distribution probe (per-update, full storage)
-            "lbl_uniq_x": lbl_uniq_x,
-            "lbl_uniq_y": lbl_uniq_y,
-            "lbl_uniq_w": lbl_uniq_w,
-            "lbl_top1_x": lbl_top1_x,
-            "lbl_top1_y": lbl_top1_y,
-            "lbl_top1_w": lbl_top1_w,
-            # X: achieved-velocity label distribution (only nonzero when use_achieved_labels=True)
-            "ach_uniq_x": ach_uniq_x,
-            "ach_uniq_y": ach_uniq_y,
-            "ach_uniq_w": ach_uniq_w,
-            "ach_top1_x": ach_top1_x,
-            "ach_top1_y": ach_top1_y,
-            "ach_top1_w": ach_top1_w,
         }
         sphere_names = ["x", "y", "w"]
         for s_idx in range(min(self.actor.num_spheres, len(sphere_names))):
@@ -753,30 +531,6 @@ class ContrastivePPO(PPO):
             loss_dict[f"alignment_{sphere_names[s_idx]}"] = alignment_sums[s_idx]
 
         return loss_dict
-
-    # ------------------------------------------------------------------
-    # Checkpoint save / load
-    # ------------------------------------------------------------------
-
-    def save(self) -> dict:
-        saved = super().save()
-        saved["repr_optimizer_state_dict"] = self.repr_optimizer.state_dict()
-        saved["counter"] = self.counter
-        saved["log_tau"] = self.log_tau.data if isinstance(self.log_tau, nn.Parameter) else self.log_tau
-        return saved
-
-    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        result = super().load(loaded_dict, load_cfg, strict)
-        if "repr_optimizer_state_dict" in loaded_dict:
-            self.repr_optimizer.load_state_dict(loaded_dict["repr_optimizer_state_dict"])
-        if "counter" in loaded_dict:
-            self.counter = loaded_dict["counter"]
-        if "log_tau" in loaded_dict:
-            if isinstance(self.log_tau, nn.Parameter):
-                self.log_tau.data.copy_(loaded_dict["log_tau"])
-            else:
-                self.log_tau = loaded_dict["log_tau"]
-        return result
 
     # ------------------------------------------------------------------
     # Factory

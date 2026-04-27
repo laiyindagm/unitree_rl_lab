@@ -357,7 +357,7 @@ class RslRlContrastiveModelCfg(RslRlMLPModelCfg):
 
     class_name: str = "unitree_rl_lab.utils.contrastive_latent_model:ContrastiveLatentModel"
     encoder_type: str = "tcn"        # "tcn" | "transformer"
-    history_len: int = 5
+    history_len: int = 10            # extended history (was 5)
     history_obs_dim: int = 51        # single frame without cmd
     cmd_dim: int = 3
     cmd_start_idx: int = 6           # cmd position in single-frame obs
@@ -365,15 +365,17 @@ class RslRlContrastiveModelCfg(RslRlMLPModelCfg):
     sphere_dim: int = 32             # per-sphere dim
     num_spheres: int = 3
     # TCN parameters
-    tcn_channels: list[int] | None = None  # default [64, 96]
+    tcn_channels: list[int] | None = None  # default [64, 96, 96] (3-layer)
     tcn_kernel_size: int = 3
-    # Transformer parameters
-    tf_d_model: int = 256
+    tcn_dilations: list[int] | None = None  # default [1, 2, 4] → RF=15 covers history_len=10
+    # Transformer parameters (defaults tuned for history_len=10)
+    tf_d_model: int = 192
     tf_n_heads: int = 4
-    tf_num_layers: int = 2
-    tf_dim_feedforward: int = 512
+    tf_num_layers: int = 3
+    tf_dim_feedforward: int = 384
     # Generator parameters
     pred_horizon: int = 3
+    pred_obs_dim: int = 36           # physical state only: ang_vel(3)+gravity(3)+joint_pos(15)+joint_vel(15)
     num_actions: int = 15
 
 
@@ -382,7 +384,12 @@ class RslRlContrastivePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """ContrastivePPO algorithm configuration."""
 
     class_name: str = "unitree_rl_lab.utils.contrastive_ppo:ContrastivePPO"
-    nce_coef: float = 0.1            # alpha — InfoNCE coefficient
+    nce_coef: float = 0.1            # alpha — InfoNCE coefficient (cmd-bin SupCon)
+    time_nce_coef: float = 0.0       # alpha_t — time-shifted positive InfoNCE (SimCLR)
+    time_shift: int = 4              # positive pair offset in env steps (~0.08s @ 50Hz)
+    use_achieved_labels: bool = False  # X: label SupCon by achieved velocity (critic obs) instead of cmd
+    achieved_obs_key: str = "critic"   # X: obs group containing base_lin_vel + base_ang_vel
+    achieved_ang_vel_scale: float = 0.2  # X: undo critic-obs static scale on base_ang_vel
     gen_coef: float = 0.5            # beta start — sequence prediction coefficient
     gen_coef_end: float = 0.1        # beta end
     gen_decay_iters: int = 10000     # beta decay iterations
@@ -390,6 +397,7 @@ class RslRlContrastivePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     learnable_tau: bool = True
     repr_lr: float = 1e-4            # representation learning rate
     warmup_iters: int = 0            # disabled — optimizer separation makes warmup redundant
+    gate_open_iters: int = 1000      # gate schedule: gate = min(counter/gate_open_iters, 1.0)
     pred_gamma: float = 0.9          # temporal decay for sequence prediction
     # Velocity quantization levels (aligned with V19d MarginalVelocityCommand bins)
     vx_levels: list[float] | None = None
@@ -427,10 +435,14 @@ class G115DofContrastiveTCNPPORunnerCfg(BasePPORunnerV3Cfg):
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,
-        nce_coef=0.1,
-        # gen_coef=0.5,
-        gen_coef=0.0,
-        gen_coef_end=0.0
+        nce_coef=0.1,            # X: restored — supcon target now achievable (achieved-vel labels)
+        time_nce_coef=0.0,       # disabled (E3 found shared-head conflict with SupCon)
+        time_shift=4,            # B (unused while time_nce_coef=0)
+        use_achieved_labels=True,  # X: label by achieved velocity (critic obs base_lin_vel + base_ang_vel_z)
+        gen_coef=0.3,            # was 0.1 — keep self-supervised gen signal alive longer
+        gen_coef_end=0.2,        # was 0.02 — hold high; the other working repr signal
+        tau_init=0.1,            # was 0.5 — SupCon canonical
+        learnable_tau=False,     # was True — kill temperature arbitrage feedback
     )
 
 
@@ -465,5 +477,11 @@ class G115DofContrastiveTransformerPPORunnerCfg(BasePPORunnerV3Cfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         nce_coef=0.1,
-        gen_coef=0.5,
+        time_nce_coef=0.0,
+        time_shift=4,
+        use_achieved_labels=True,
+        gen_coef=0.3,
+        gen_coef_end=0.2,
+        tau_init=0.1,
+        learnable_tau=False,
     )

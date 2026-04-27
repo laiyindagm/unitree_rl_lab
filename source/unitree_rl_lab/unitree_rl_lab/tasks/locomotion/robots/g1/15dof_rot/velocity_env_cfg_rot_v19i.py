@@ -1,27 +1,44 @@
-"""15-DOF rotation config V19f — "Aggressive Rotation".
+"""15-DOF rotation config V19i — "Scheduled Standing".
 
-V19e Results (17k iter):
-  - vx perf 0.408-0.651 (low bins ~40% depressed by direction-gate)
-  - vy perf 0.300-0.464 (zero-bin = 0.300, standing issue)
-  - wz perf 0.143-0.197 (NO improvement over V19d)
-  - Zero-speed: robot still walks when cmd=0
+V19h Catastrophic Failure (20k iter):
+  - Mean reward 76.5 -> 34.4 (-55%)
+  - Episode length 994 -> 723 (-27%, early termination)
+  - bad_orientation 1.6% -> 43.5% (26x more falls!)
+  - entropy_loss -0.10 -> +9.02 (entropy INCREASING, action_std 0.34->0.54)
+  - track_ang_vel_z 2.14 -> 1.01 (-53%)
+  - 15k/20k pt fails sim2sim (10k still mostly OK)
 
-V19f Aggressive Changes:
-  1. SHARP wz TRACKING: supplementary exp kernel with sigma=0.20 (vs 0.50).
-     Provides 5-9x stronger gradient at small cmd_wz. Weight=1.0.
-  2. PROPORTIONAL wz PENALTY: replaces binary wz_nonresponse.
-     penalty = |cmd_wz| * (1 - signed_ratio). Continuous gradient, no dead
-     zone after actual_wz > 0.05. Weight=-4.0.
-  3. BOOST ORIGINAL wz TRACKING: weight 2.0 -> 3.0. Stronger large-cmd gradient.
-  4. MORE ROTATION ENVS: pure_wz 20% -> 25%.
-  5. ZERO-SPEED FIX: zero_cmd_body_vel (weight=-1.5) penalizes root velocity
-     when cmd_norm < 0.1.
+Diagnosis: SUICIDE POLICY
+  - V19h piled ~9.5/step penalty in standing envs (20% of all envs).
+  - Policy discovered: falling -> early termination -> escape penalty.
+  - PPO saw incoherent value function -> entropy bonus exploded action_std.
+  - Late checkpoints capture the collapsed policy -> sim2sim fails.
 
-Expected wz incentive at cmd=0.1 (standing -> perfect):
-  V19e: 0.078 (exp) + ~0.1 (binary nonresponse) = ~0.18
-  V19f: 0.117 (exp) + 0.221 (sharp) + 0.400 (proportional) = ~0.74  (4x)
+Pattern observed across V19 series (user insight):
+  - V19e: 17k stable (baseline)
+  - V19f: backward drift bug
+  - V19g: 18.7k stable but won't stand
+  - V19h: collapsed at ~10k
+  - Each round added MORE always-on penalties -> shrinking stable basin.
 
-Distribution: 10% standing, 15% pure_vx, 15% pure_vy, 25% pure_wz, 35% joint.
+V19i Strategy: minimal changes from V19g + scheduled standing penalties.
+
+Changes vs V19g (which trained stably for 18.7k):
+  1. zero_cmd_body_vel -> zero_cmd_body_vel_scheduled
+     weight -1.5 -> -3.0 PEAK, ramp from step 24k to 72k.
+     Policy learns walking first; standing constraint introduced gradually.
+  2. NEW stand_still_scheduled (peak weight -1.0, same ramp)
+     Acts as joint-pose anchor at zero cmd, complementary to body_vel.
+  3. KEEP feet_contact_without_cmd inherited from V5a (weight 0.3)
+  4. KEEP rel_standing_envs = 0.10 (NOT 0.20)
+  5. SKIP zero_cmd_foot_height (didn't help in V19h, 5x of nothing is nothing)
+
+Kept identical to V19g (proven stable):
+  - Standard track_lin_vel_xy
+  - track_ang_vel_z (3.0) + track_ang_vel_z_sharp (sigma=0.20)
+  - wz_proportional (-2.0)
+  - pure_rotation_drift (-1.5)
+  - Distribution: 10% standing, 15% pure_vx, 15% pure_vy, 25% pure_wz, 35% joint
 """
 
 import math
@@ -35,7 +52,6 @@ from unitree_rl_lab.tasks.locomotion import mdp
 
 from .velocity_env_cfg_rot import (
     CurriculumCfg as RotCurriculumCfg,
-    RewardsCfg as RotRewardsCfg,
 )
 from .velocity_env_cfg_rot_v16b import (
     RewardsCfg as V16bRewardsCfg,
@@ -45,14 +61,13 @@ from .velocity_env_cfg_rot_v15a import (
 )
 
 
-# ---------- Commands: increased pure_wz fraction ----------
 @configclass
 class CommandsCfg:
     base_velocity = mdp.MarginalVelocityCommandCfg(
         asset_name="robot",
         resampling_time_range=(8.0, 12.0),
-        rel_standing_envs=0.10,
-        rel_rotating_envs=0.25,       # 0.20 -> 0.25 (more rotation training)
+        rel_standing_envs=0.10,         # back to V19g
+        rel_rotating_envs=0.25,
         rel_pure_vx_envs=0.15,
         rel_pure_vy_envs=0.15,
         rel_linear_envs=0.0,
@@ -64,7 +79,6 @@ class CommandsCfg:
             lin_vel_y=(-0.3, 0.3),
             ang_vel_z=(-0.3, 0.3),
         ),
-        # --- vx_pos: 15 discrete levels (0.1 to 1.5) ---
         vx_pos_bins=[
             (0.1, 0.1), (0.2, 0.2), (0.3, 0.3),
             (0.4, 0.4), (0.5, 0.5),
@@ -74,14 +88,12 @@ class CommandsCfg:
             (1.2, 1.2), (1.3, 1.3),
             (1.4, 1.4), (1.5, 1.5),
         ],
-        # --- vx_neg: 8 discrete levels (-0.1 to -0.8) ---
         vx_neg_bins=[
             (-0.1, -0.1), (-0.2, -0.2), (-0.3, -0.3),
             (-0.4, -0.4), (-0.5, -0.5),
             (-0.6, -0.6), (-0.7, -0.7),
             (-0.8, -0.8),
         ],
-        # --- vy: 11 levels (0, +/-0.1..+/-0.5) ---
         vy_bins=[
             (0.0, 0.0),
             (0.1, 0.1), (-0.1, -0.1),
@@ -90,7 +102,6 @@ class CommandsCfg:
             (0.4, 0.4), (-0.4, -0.4),
             (0.5, 0.5), (-0.5, -0.5),
         ],
-        # --- wz: 16 levels (+/-0.1..+/-0.8) ---
         wz_bins=[
             (0.1, 0.1), (-0.1, -0.1),
             (0.2, 0.2), (-0.2, -0.2),
@@ -101,12 +112,10 @@ class CommandsCfg:
             (0.7, 0.7), (-0.7, -0.7),
             (0.8, 0.8), (-0.8, -0.8),
         ],
-        # Staged curriculum: conservative initial range
         num_active_vx_pos=3,
         num_active_vx_neg=3,
         num_active_vy=7,
         num_active_wz=6,
-        # Adaptive parameters
         ema_alpha=0.1,
         temperature=8.0,
         min_sampling_prob=0.01,
@@ -116,55 +125,48 @@ class CommandsCfg:
     )
 
 
-# ---------- Rewards: aggressive rotation ----------
 @configclass
 class RewardsCfg(V16bRewardsCfg):
-    # C (from V19e): rotation-skip linear tracking
+    # ---------- V19g identical (linear/angular tracking, anti-cheat) ----------
     track_lin_vel_xy = RewTerm(
-        func=mdp.track_lin_vel_xy_rotation_skip,
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
         weight=1.0,
-        params={
-            "command_name": "base_velocity",
-            "std": math.sqrt(0.25),
-            "lin_threshold": 0.05,
-            "yaw_threshold": 0.05,
-        },
-    )
-    # Original wz tracking — BOOSTED: 2.0 -> 3.0
-    track_ang_vel_z = RewTerm(
-        func=mdp.track_ang_vel_z_rotating_aware,
-        weight=0.5 * 2 * 3,    # 3.0 (was 2.0 in V19e)
         params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
     )
-    # NEW: supplementary SHARP wz tracking (sigma=0.20)
-    # Provides 5-9x stronger gradient at small cmd_wz
+    track_ang_vel_z = RewTerm(
+        func=mdp.track_ang_vel_z_rotating_aware,
+        weight=0.5 * 2 * 3,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.25)},
+    )
     track_ang_vel_z_sharp = RewTerm(
         func=mdp.track_ang_vel_z_rotating_aware,
         weight=1.0,
         params={"command_name": "base_velocity", "std": 0.20},
     )
-    # NEW: proportional wz penalty (replaces binary wz_nonresponse)
     wz_proportional = RewTerm(
         func=mdp.wz_proportional_penalty,
-        weight=-4.0,
+        weight=-2.0,
+        params={"command_name": "base_velocity", "cmd_threshold": 0.08},
+    )
+    pure_rotation_drift = RewTerm(
+        func=mdp.pure_rotation_lin_drift,
+        weight=-1.5,
         params={
             "command_name": "base_velocity",
-            "cmd_threshold": 0.08,
+            "lin_threshold": 0.05,
+            "yaw_threshold": 0.05,
         },
     )
-    # Waist damping (from V19e)
     waist_roll_vel = RewTerm(
         func=mdp.waist_joint_vel_penalty,
         weight=-0.35,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["waist_roll_joint"])},
     )
-    # Torso flat orientation (from V19e)
     torso_flat_orient = RewTerm(
         func=mdp.torso_flat_orientation,
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", body_names="torso_link")},
     )
-    # Movement incentive (from V19e)
     movement_incentive = RewTerm(
         func=mdp.movement_incentive_scheduled,
         weight=-3.0,
@@ -176,7 +178,6 @@ class RewardsCfg(V16bRewardsCfg):
             "end_step": 96000,
         },
     )
-    # General linear nonresponse (from V19e)
     cmd_nonresponse = RewTerm(
         func=mdp.cmd_nonresponse_penalty,
         weight=-2.0,
@@ -186,15 +187,29 @@ class RewardsCfg(V16bRewardsCfg):
             "vel_threshold": 0.05,
         },
     )
-    # NEW: zero-speed standing fix
+
+    # ---------- V19i: SCHEDULED standing constraints ----------
     zero_cmd_body_vel = RewTerm(
-        func=mdp.zero_cmd_body_vel,
-        weight=-1.5,
-        params={"command_name": "base_velocity"},
+        func=mdp.zero_cmd_body_vel_scheduled,
+        weight=-3.0,                    # peak weight
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.1,
+            "start_step": 24000,        # let policy learn walking first
+            "end_step": 72000,          # full strength after stable locomotion
+        },
+    )
+    stand_still_scheduled = RewTerm(
+        func=mdp.stand_still_scheduled,
+        weight=-1.0,                    # peak weight
+        params={
+            "command_name": "base_velocity",
+            "start_step": 24000,
+            "end_step": 72000,
+        },
     )
 
 
-# ---------- Curriculum: same as V19d/V19e ----------
 @configclass
 class CurriculumCfg(RotCurriculumCfg):
     terrain_levels = CurrTerm(func=mdp.terrain_levels_vel)
@@ -209,7 +224,6 @@ class CurriculumCfg(RotCurriculumCfg):
     )
 
 
-# ---------- Env ----------
 @configclass
 class RobotEnvCfg(V15aEnvCfg):
     rewards: RewardsCfg = RewardsCfg()

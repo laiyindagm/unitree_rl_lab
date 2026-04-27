@@ -186,3 +186,25 @@ class RobotPlayEnvCfg(RobotEnvCfg):
         self.commands.base_velocity.num_active_vx_neg = None
         self.commands.base_velocity.num_active_vy = None
         self.commands.base_velocity.num_active_wz = None
+
+
+# ---------- CLP variants: extend observation history to 10 frames ----------
+# CLP encoder (TCN with dilations [1,2,4] or scaled Transformer) needs a richer
+# temporal context than the default 5-frame history.  Override only history_length
+# so policy/critic obs become 10*54 = 540 dims (matches model._latent_dim=744
+# = 540 + 96 + 108).
+
+@configclass
+class RobotEnvCfgCLP(RobotEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.history_length = 10
+        self.observations.critic.history_length = 10
+
+
+@configclass
+class RobotPlayEnvCfgCLP(RobotPlayEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.policy.history_length = 10
+        self.observations.critic.history_length = 10

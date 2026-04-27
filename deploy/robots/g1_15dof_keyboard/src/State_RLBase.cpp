@@ -15,6 +15,70 @@ REGISTER_OBSERVATION(velocity_commands)
     return std::vector<float>{cmd[0], cmd[1], cmd[2]};
 }
 
+// V20a: 5-mode one-hot gait token (standing/pure_vx/pure_vy/pure_wz/joint).
+// MUST mirror mdp.gait_mode_token in Python training code so the policy sees
+// identical observations in sim and on hardware. Reads keyboard command,
+// applies per-axis epsilon thresholds, returns one-hot vector.
+REGISTER_OBSERVATION(gait_mode_token)
+{
+    const auto cmd = g_keyboard_teleop.command();
+    const float eps_x = params["eps_x"] ? params["eps_x"].as<float>() : 0.1f;
+    const float eps_y = params["eps_y"] ? params["eps_y"].as<float>() : 0.1f;
+    const float eps_w = params["eps_w"] ? params["eps_w"].as<float>() : 0.1f;
+
+    const bool vx_zero = std::abs(cmd[0]) < eps_x;
+    const bool vy_zero = std::abs(cmd[1]) < eps_y;
+    const bool wz_zero = std::abs(cmd[2]) < eps_w;
+
+    const bool standing = vx_zero && vy_zero && wz_zero;
+    const bool pure_vx  = (!vx_zero) && vy_zero && wz_zero;
+    const bool pure_vy  = vx_zero && (!vy_zero) && wz_zero;
+    const bool pure_wz  = vx_zero && vy_zero && (!wz_zero);
+    const bool joint    = !(standing || pure_vx || pure_vy || pure_wz);
+
+    return std::vector<float>{
+        standing ? 1.0f : 0.0f,
+        pure_vx  ? 1.0f : 0.0f,
+        pure_vy  ? 1.0f : 0.0f,
+        pure_wz  ? 1.0f : 0.0f,
+        joint    ? 1.0f : 0.0f,
+    };
+}
+
+// V20j: 3-mode one-hot gait token {standing, pure_wz, other}.
+// MUST mirror mdp.gait_mode_token_3 in Python training code. Collapses
+// pure_vx/pure_vy/joint into a single "other" bucket so joint envs'
+// cmd_wz!=0 yaw signal can transfer (via shared subpolicy params) to
+// pure_vx/pure_vy samples. Keeps {standing, pure_wz} isolated for
+// dedicated subpolicies (qualitatively distinct objectives).
+//
+// Coexistence with the 5-mode gait_mode_token registration above is
+// safe: deploy.yaml selects an observation by name, so any given
+// policy.onnx uses exactly one of {gait_mode_token, gait_mode_token_3}
+// (or neither, for V19f/V20i which omit the token entirely).
+REGISTER_OBSERVATION(gait_mode_token_3)
+{
+    const auto cmd = g_keyboard_teleop.command();
+    const float eps_x = params["eps_x"] ? params["eps_x"].as<float>() : 0.1f;
+    const float eps_y = params["eps_y"] ? params["eps_y"].as<float>() : 0.1f;
+    const float eps_w = params["eps_w"] ? params["eps_w"].as<float>() : 0.1f;
+
+    const bool vx_zero = std::abs(cmd[0]) < eps_x;
+    const bool vy_zero = std::abs(cmd[1]) < eps_y;
+    const bool wz_zero = std::abs(cmd[2]) < eps_w;
+
+    const bool standing = vx_zero && vy_zero && wz_zero;
+    const bool pure_wz  = vx_zero && vy_zero && (!wz_zero);
+    const bool other    = !(standing || pure_wz);
+
+    return std::vector<float>{
+        standing ? 1.0f : 0.0f,
+        pure_wz  ? 1.0f : 0.0f,
+        other    ? 1.0f : 0.0f,
+    };
+}
+
+
 // Override gait_phase to support speed-adaptive mode (V9a).
 // Detects walk_period in params -> speed-adaptive; otherwise falls back to
 // fixed-period mode (original behaviour).
