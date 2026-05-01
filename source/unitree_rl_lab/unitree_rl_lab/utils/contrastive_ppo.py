@@ -40,6 +40,7 @@ def factored_infonce(
     projections: list[torch.Tensor],
     labels_per_sphere: list[torch.Tensor],
     temperature: float | torch.Tensor,
+    max_samples: int | None = None,
 ) -> torch.Tensor:
     """Factored SupCon-style InfoNCE over independent spheres.
 
@@ -52,12 +53,13 @@ def factored_infonce(
         Scalar mean loss across spheres.
     """
     B = projections[0].shape[0]
+    sample_cap = _NCE_MAX_SAMPLES if max_samples is None else max_samples
     # Subsample if batch too large to keep O(B^2) tractable
-    if B > _NCE_MAX_SAMPLES:
-        idx = torch.randperm(B, device=projections[0].device)[:_NCE_MAX_SAMPLES]
+    if sample_cap > 0 and B > sample_cap:
+        idx = torch.randperm(B, device=projections[0].device)[:sample_cap]
         projections = [p[idx] for p in projections]
         labels_per_sphere = [l[idx] for l in labels_per_sphere]
-        B = _NCE_MAX_SAMPLES
+        B = sample_cap
 
     total = torch.tensor(0.0, device=projections[0].device)
     for p, labels in zip(projections, labels_per_sphere):
@@ -80,6 +82,49 @@ def factored_infonce(
             total = total - mean_log_prob[has_pos].mean()
 
     return total / len(projections)
+
+
+def factored_cross_infonce(
+    source_projections: list[torch.Tensor],
+    target_projections: list[torch.Tensor],
+    source_labels_per_sphere: list[torch.Tensor],
+    target_labels_per_sphere: list[torch.Tensor],
+    temperature: float | torch.Tensor,
+    max_samples: int | None = None,
+) -> torch.Tensor:
+    """Factored cross-view InfoNCE between source and target towers."""
+    B = source_projections[0].shape[0]
+    sample_cap = _NCE_MAX_SAMPLES if max_samples is None else max_samples
+    if sample_cap > 0 and B > sample_cap:
+        idx = torch.randperm(B, device=source_projections[0].device)[:sample_cap]
+        source_projections = [p[idx] for p in source_projections]
+        target_projections = [p[idx] for p in target_projections]
+        source_labels_per_sphere = [l[idx] for l in source_labels_per_sphere]
+        target_labels_per_sphere = [l[idx] for l in target_labels_per_sphere]
+
+    total = torch.tensor(0.0, device=source_projections[0].device)
+    for src, tgt, src_labels, tgt_labels in zip(
+        source_projections,
+        target_projections,
+        source_labels_per_sphere,
+        target_labels_per_sphere,
+    ):
+        sim = torch.mm(src, tgt.t()) / temperature
+        mask_pos = src_labels.unsqueeze(1) == tgt_labels.unsqueeze(0)
+
+        logits_max, _ = sim.detach().max(dim=1, keepdim=True)
+        logits = sim - logits_max
+        exp_logits = torch.exp(logits)
+        log_denom = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+        log_prob = logits - log_denom
+
+        num_pos = mask_pos.float().sum(dim=1)
+        has_pos = num_pos > 0
+        if has_pos.any():
+            mean_log_prob = (log_prob * mask_pos.float()).sum(dim=1) / (num_pos + 1e-8)
+            total = total - mean_log_prob[has_pos].mean()
+
+    return total / len(source_projections)
 
 
 def time_infonce(

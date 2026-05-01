@@ -4,6 +4,8 @@ from dataclasses import MISSING, field
 
 from isaaclab.envs.mdp import UniformVelocityCommandCfg, UniformVelocityCommand
 from isaaclab.utils import configclass
+from isaaclab.assets import Articulation
+from isaaclab.managers import SceneEntityCfg
 
 import torch
 from collections.abc import Sequence
@@ -658,6 +660,12 @@ class MarginalVelocityCommandCfg(UniformVelocityCommandCfg):
     """Velocity threshold for zero-speed accuracy."""
     min_response_speed: float = 0.0
     """Direction-gated accuracy: actual must exceed this in commanded direction. 0=off."""
+    enable_diagnostics: bool = False
+    """Enable V21a mode-conditioned diagnostics without changing behavior."""
+    diagnostic_every_n_iters: int = 1
+    diagnostic_steps_per_iter: int = 24
+    diagnostic_lin_speed_threshold: float = 0.5
+    diagnostic_lin_speed_transition_width: float = 0.2
 
 
 class MarginalVelocityCommand(UniformVelocityCommand):
@@ -728,6 +736,60 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         self._env_vx_acc_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._env_vy_acc_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._env_wz_acc_count = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        self._diagnostic_mode_names = ("standing", "pure_wz", "other")
+        self._diagnostic_mode_index = {name: i for i, name in enumerate(self._diagnostic_mode_names)}
+        self._diagnostic_mode_accum = {
+            name: {"count": 0.0, "sum": {}}
+            for name in self._diagnostic_mode_names
+        }
+        self._diagnostic_speed_bucket_accum = {}
+        self._waist_roll_joint_idx = None
+        self._waist_pitch_joint_idx = None
+        self._waist_yaw_joint_idx = None
+        self._head_body_idx = None
+        self._camera_body_idx = None
+        self._left_ankle_roll_body_idx = None
+        self._right_ankle_roll_body_idx = None
+        self._ankle_body_ids = None
+        self._ankle_contact_body_ids = None
+        self._contact_sensor_name = None
+        robot: Articulation = self.robot
+        for joint_name, attr_name in (
+            ("waist_roll_joint", "_waist_roll_joint_idx"),
+            ("waist_pitch_joint", "_waist_pitch_joint_idx"),
+            ("waist_yaw_joint", "_waist_yaw_joint_idx"),
+        ):
+            joint_ids, _ = robot.find_joints(joint_name)
+            if len(joint_ids) > 0:
+                setattr(self, attr_name, int(joint_ids[0]))
+        body_name_to_idx = {name: i for i, name in enumerate(robot.body_names)}
+        for body_name, attr_name in (
+            ("head_link", "_head_body_idx"),
+            ("d435_link", "_camera_body_idx"),
+            ("left_ankle_roll_link", "_left_ankle_roll_body_idx"),
+            ("right_ankle_roll_link", "_right_ankle_roll_body_idx"),
+        ):
+            body_idx = body_name_to_idx.get(body_name)
+            if body_idx is not None:
+                setattr(self, attr_name, body_idx)
+
+        if self._left_ankle_roll_body_idx is not None and self._right_ankle_roll_body_idx is not None:
+            self._ankle_body_ids = torch.tensor(
+                [self._left_ankle_roll_body_idx, self._right_ankle_roll_body_idx],
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        ankle_contact_cfg = SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*", preserve_order=True)
+        ankle_contact_cfg.resolve(self._env.scene)
+        if ankle_contact_cfg.body_ids != slice(None):
+            self._ankle_contact_body_ids = torch.tensor(
+                ankle_contact_cfg.body_ids,
+                device=self.device,
+                dtype=torch.long,
+            )
+            self._contact_sensor_name = ankle_contact_cfg.name
 
         # Active bin counts for staged curriculum
         self._active_n_vx_pos = n_pos if cfg.num_active_vx_pos is None else min(cfg.num_active_vx_pos, n_pos)
@@ -924,6 +986,142 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         self._env_wz_acc_sum += wz_acc
         self._env_wz_acc_count += 1
 
+    def _get_mode_names(self, env_ids: torch.Tensor) -> list[str]:
+        mode_names = ["other"] * env_ids.shape[0]
+        standing = self.is_standing_env[env_ids]
+        rotating = self.is_rotating_env[env_ids]
+        for i in range(env_ids.shape[0]):
+            if standing[i]:
+                mode_names[i] = "standing"
+            elif rotating[i]:
+                mode_names[i] = "pure_wz"
+        return mode_names
+
+    def _get_speed_bucket_names(self, env_ids: torch.Tensor) -> list[str]:
+        cmds = self.vel_command_b[env_ids]
+        cmd_lin = torch.linalg.norm(cmds[:, :2], dim=1)
+        cmd_wz = cmds[:, 2].abs()
+        bucket_names: list[str] = []
+        mode_names = self._get_mode_names(env_ids)
+        lin_threshold = float(self.cfg.diagnostic_lin_speed_threshold)
+        lin_width = max(float(self.cfg.diagnostic_lin_speed_transition_width), 0.0)
+        lin_lo = lin_threshold - lin_width
+        lin_hi = lin_threshold + lin_width
+        use_legacy_lin_bucket_names = abs(lin_threshold - 0.5) < 1e-6 and abs(lin_width - 0.2) < 1e-6
+        for i, mode_name in enumerate(mode_names):
+            if mode_name == "pure_wz":
+                speed = float(cmd_wz[i].item())
+                prefix = "pure_wz"
+                if speed < 0.3:
+                    bucket = "low"
+                elif speed < 0.7:
+                    bucket = "mid"
+                else:
+                    bucket = "high"
+            elif mode_name == "other":
+                speed = float(cmd_lin[i].item())
+                prefix = "other"
+                if speed < lin_lo:
+                    bucket = "low"
+                elif speed < lin_hi:
+                    bucket = "mid" if use_legacy_lin_bucket_names else "transition"
+                else:
+                    bucket = "high"
+            else:
+                bucket_names.append("standing")
+                continue
+            bucket_names.append(f"{prefix}_{bucket}")
+        return bucket_names
+
+    @staticmethod
+    def _accumulate_group_metrics(accum: dict[str, dict[str, float] | float], group_name: str, metrics: dict[str, float]):
+        group = accum.setdefault(group_name, {"count": 0.0, "sum": {}})
+        group["count"] += 1.0
+        sums = group["sum"]
+        for key, value in metrics.items():
+            sums[key] = sums.get(key, 0.0) + float(value)
+
+    def _summarize_group_metrics(self, accum: dict[str, dict[str, dict[str, float] | float]], order: list[str] | tuple[str, ...] | None = None) -> dict[str, float]:
+        keys = list(order) if order is not None else sorted(accum.keys())
+        summary: dict[str, float] = {}
+        for key in keys:
+            if key not in accum:
+                continue
+            item = accum[key]
+            count = float(item["count"])
+            if count <= 0:
+                continue
+            sums = item["sum"]
+            summary[f"{key}/count"] = count
+            for metric_name, metric_sum in sums.items():
+                summary[f"{key}/{metric_name}"] = metric_sum / count
+        return summary
+
+    def get_diagnostic_log_data(self) -> dict[str, float]:
+        if not self.cfg.enable_diagnostics:
+            return {}
+        summary: dict[str, float] = {}
+        for key, value in self._summarize_group_metrics(self._diagnostic_mode_accum, self._diagnostic_mode_names).items():
+            summary[f"mode/{key}"] = value
+        for key, value in self._summarize_group_metrics(self._diagnostic_speed_bucket_accum).items():
+            summary[f"speed_bucket/{key}"] = value
+        return summary
+
+    def reset_diagnostic_log_data(self):
+        self._diagnostic_mode_accum = {
+            name: {"count": 0.0, "sum": {}}
+            for name in self._diagnostic_mode_names
+        }
+        self._diagnostic_speed_bucket_accum = {}
+
+    def _should_collect_diagnostics(self) -> bool:
+        if not self.cfg.enable_diagnostics:
+            return False
+        every_n = max(int(self.cfg.diagnostic_every_n_iters), 1)
+        steps_per_iter = max(int(self.cfg.diagnostic_steps_per_iter), 1)
+        current_iter = int(self._env.common_step_counter // steps_per_iter)
+        return current_iter % every_n == 0
+
+    def _format_group_metrics(self, title: str, accum: dict[str, dict[str, dict[str, float] | float]], order: list[str] | tuple[str, ...] | None = None) -> str:
+        keys = list(order) if order is not None else sorted(accum.keys())
+        lines: list[str] = []
+        for key in keys:
+            if key not in accum:
+                continue
+            item = accum[key]
+            count = float(item["count"])
+            if count <= 0:
+                continue
+            sums = item["sum"]
+            parts = [f"n={int(count)}"]
+            for metric_name in (
+                "lin_err",
+                "yaw_err",
+                "parasitic_xy",
+                "parasitic_wz",
+                "waist_roll_vel",
+                "waist_pitch_vel",
+                "waist_yaw_vel",
+                "head_ang_vel",
+                "camera_ang_vel",
+                "foot_contact_force_z",
+                "foot_contact_force_xy",
+                "foot_contact_count",
+                "foot_air_time",
+                "foot_contact_time",
+                "foot_speed_xy",
+                "base_ang_vel_xy",
+                "gravity_tilt",
+                "bad_orientation",
+                "terminated",
+            ):
+                if metric_name in sums:
+                    parts.append(f"{metric_name}={sums[metric_name] / count:.3f}")
+            lines.append(f"  {key}: " + ", ".join(parts))
+        if not lines:
+            return ""
+        return f"\n[V21a] {title}:\n" + "\n".join(lines)
+
     def get_episode_accuracy(self, env_ids):
         """Get per-axis average accuracy for completed episodes, then reset."""
         if isinstance(env_ids, torch.Tensor):
@@ -938,6 +1136,109 @@ class MarginalVelocityCommand(UniformVelocityCommand):
         vx_acc = self._env_vx_acc_sum[eids] / vx_count
         vy_acc = self._env_vy_acc_sum[eids] / vy_count
         wz_acc = self._env_wz_acc_sum[eids] / wz_count
+
+        if self._should_collect_diagnostics():
+            mode_names = self._get_mode_names(eids)
+            bucket_names = self._get_speed_bucket_names(eids)
+            cmds = self.vel_command_b[eids]
+            actual_lin = self.robot.data.root_lin_vel_b[eids, :2]
+            actual_wz = self.robot.data.root_ang_vel_b[eids, 2]
+            actual_ang_xy = torch.linalg.norm(self.robot.data.root_ang_vel_b[eids, :2], dim=1)
+            gravity_tilt = torch.linalg.norm(self.robot.data.projected_gravity_b[eids, :2], dim=1)
+            bad_orientation = (self.robot.data.projected_gravity_b[eids, 2] > -0.8).float()
+            terminated = self._env.termination_manager.terminated[eids].float()
+
+            waist_roll_vel = None
+            waist_pitch_vel = None
+            waist_yaw_vel = None
+            if self._waist_roll_joint_idx is not None:
+                waist_roll_vel = self.robot.data.joint_vel[eids, self._waist_roll_joint_idx].abs()
+            if self._waist_pitch_joint_idx is not None:
+                waist_pitch_vel = self.robot.data.joint_vel[eids, self._waist_pitch_joint_idx].abs()
+            if self._waist_yaw_joint_idx is not None:
+                waist_yaw_vel = self.robot.data.joint_vel[eids, self._waist_yaw_joint_idx].abs()
+
+            head_ang_vel = None
+            camera_ang_vel = None
+            foot_contact_force_z = None
+            foot_contact_force_xy = None
+            foot_contact_count = None
+            foot_air_time = None
+            foot_contact_time = None
+            foot_speed_xy = None
+            if self._head_body_idx is not None:
+                head_ang_vel = torch.linalg.norm(self.robot.data.body_ang_vel_w[eids, self._head_body_idx, :], dim=1)
+            if self._camera_body_idx is not None:
+                camera_ang_vel = torch.linalg.norm(self.robot.data.body_ang_vel_w[eids, self._camera_body_idx, :], dim=1)
+
+            if self._ankle_body_ids is not None:
+                foot_speed_xy = torch.linalg.norm(self.robot.data.body_lin_vel_w[eids][:, self._ankle_body_ids, :2], dim=2).mean(dim=1)
+            if self._ankle_contact_body_ids is not None and self._contact_sensor_name is not None:
+                contact_sensor = self._env.scene.sensors[self._contact_sensor_name]
+                foot_forces = contact_sensor.data.net_forces_w[eids][:, self._ankle_contact_body_ids, :]
+                foot_contact_force_z = torch.abs(foot_forces[:, :, 2]).mean(dim=1)
+                foot_contact_force_xy = torch.linalg.norm(foot_forces[:, :, :2], dim=2).mean(dim=1)
+                foot_contact_count = (
+                    contact_sensor.data.current_contact_time[eids][:, self._ankle_contact_body_ids] > 0
+                ).float().sum(dim=1)
+                foot_air_time = contact_sensor.data.last_air_time[eids][:, self._ankle_contact_body_ids].mean(dim=1)
+                foot_contact_time = contact_sensor.data.last_contact_time[eids][:, self._ankle_contact_body_ids].mean(dim=1)
+
+            for i in range(eids.shape[0]):
+                cmd_vx = float(cmds[i, 0].item())
+                cmd_vy = float(cmds[i, 1].item())
+                cmd_wz = float(cmds[i, 2].item())
+                actual_vx = float(actual_lin[i, 0].item())
+                actual_vy = float(actual_lin[i, 1].item())
+                actual_wz_i = float(actual_wz[i].item())
+                cmd_lin_abs = (cmd_vx ** 2 + cmd_vy ** 2) ** 0.5
+                lin_err_terms = []
+                parasitic_terms = []
+                if abs(cmd_vx) >= self.cfg.accuracy_cmd_min:
+                    lin_err_terms.append(abs(actual_vx - cmd_vx) / max(abs(cmd_vx), self.cfg.accuracy_cmd_min))
+                else:
+                    parasitic_terms.append(abs(actual_vx))
+                if abs(cmd_vy) >= self.cfg.accuracy_cmd_min:
+                    lin_err_terms.append(abs(actual_vy - cmd_vy) / max(abs(cmd_vy), self.cfg.accuracy_cmd_min))
+                else:
+                    parasitic_terms.append(abs(actual_vy))
+                lin_err = sum(lin_err_terms) / len(lin_err_terms) if lin_err_terms else 0.0
+                yaw_err = abs(actual_wz_i - cmd_wz) / max(abs(cmd_wz), self.cfg.accuracy_cmd_min) if abs(cmd_wz) >= self.cfg.accuracy_cmd_min else 0.0
+                parasitic_wz = abs(actual_wz_i) if abs(cmd_wz) < self.cfg.accuracy_cmd_min and cmd_lin_abs >= self.cfg.accuracy_cmd_min else 0.0
+                metrics = {
+                    "lin_err": lin_err,
+                    "yaw_err": yaw_err,
+                    "parasitic_xy": sum(parasitic_terms) / len(parasitic_terms) if parasitic_terms else 0.0,
+                    "parasitic_wz": parasitic_wz,
+                    "base_ang_vel_xy": float(actual_ang_xy[i].item()),
+                    "gravity_tilt": float(gravity_tilt[i].item()),
+                    "bad_orientation": float(bad_orientation[i].item()),
+                    "terminated": float(terminated[i].item()),
+                }
+                if waist_roll_vel is not None:
+                    metrics["waist_roll_vel"] = float(waist_roll_vel[i].item())
+                if waist_pitch_vel is not None:
+                    metrics["waist_pitch_vel"] = float(waist_pitch_vel[i].item())
+                if waist_yaw_vel is not None:
+                    metrics["waist_yaw_vel"] = float(waist_yaw_vel[i].item())
+                if head_ang_vel is not None:
+                    metrics["head_ang_vel"] = float(head_ang_vel[i].item())
+                if camera_ang_vel is not None:
+                    metrics["camera_ang_vel"] = float(camera_ang_vel[i].item())
+                if foot_contact_force_z is not None:
+                    metrics["foot_contact_force_z"] = float(foot_contact_force_z[i].item())
+                if foot_contact_force_xy is not None:
+                    metrics["foot_contact_force_xy"] = float(foot_contact_force_xy[i].item())
+                if foot_contact_count is not None:
+                    metrics["foot_contact_count"] = float(foot_contact_count[i].item())
+                if foot_air_time is not None:
+                    metrics["foot_air_time"] = float(foot_air_time[i].item())
+                if foot_contact_time is not None:
+                    metrics["foot_contact_time"] = float(foot_contact_time[i].item())
+                if foot_speed_xy is not None:
+                    metrics["foot_speed_xy"] = float(foot_speed_xy[i].item())
+                self._accumulate_group_metrics(self._diagnostic_mode_accum, mode_names[i], metrics)
+                self._accumulate_group_metrics(self._diagnostic_speed_bucket_accum, bucket_names[i], metrics)
 
         # Reset accumulators
         self._env_vx_acc_sum[eids] = 0.0
@@ -1085,7 +1386,15 @@ class MarginalVelocityCommand(UniformVelocityCommand):
             _fmt_axis("wz", self._wz_edges, self._wz_perf, wz_probs,
                        self._wz_update_count, self._wz_active, self._wz_sample_mask),
         ]
-        print("".join(parts), flush=True)
+        diagnostic_sections = []
+        if self.cfg.enable_diagnostics:
+            diagnostic_sections = [
+                self._format_group_metrics("mode diagnostics", self._diagnostic_mode_accum, self._diagnostic_mode_names),
+                self._format_group_metrics("speed-bucket diagnostics", self._diagnostic_speed_bucket_accum),
+            ]
+        print("".join(parts + diagnostic_sections), flush=True)
+        if self.cfg.enable_diagnostics:
+            self.reset_diagnostic_log_data()
 
 
 # Patch the cfg to use our custom command class

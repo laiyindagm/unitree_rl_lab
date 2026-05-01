@@ -1,14 +1,16 @@
 """Left-right symmetry augmentation for G1 15-DOF humanoid.
 
 Observation layout (per frame, history_length=5, flatten_history_dim=True):
-  base_ang_vel       : 3 dims  × 5 = 15
-  projected_gravity  : 3 dims  × 5 = 15
-  velocity_commands  : 3 dims  × 5 = 15
-  joint_pos_rel      : 15 dims × 5 = 75
-  joint_vel_rel      : 15 dims × 5 = 75
-  last_action        : 15 dims × 5 = 75
-  [gait_phase]       : 2 dims  × 5 = 10  (optional)
-  Total: 270 (without gait_phase) or 280 (with gait_phase)
+  base_ang_vel                 : 3 dims  × 5 = 15
+  projected_gravity            : 3 dims  × 5 = 15
+  velocity_commands            : 3 dims  × 5 = 15
+  [lin_speed_reward_regime_token] : 2 dims  × 5 = 10  (optional)
+  [gait_mode_token_3]          : 3 dims  × 5 = 15  (optional)
+  joint_pos_rel                : 15 dims × 5 = 75
+  joint_vel_rel                : 15 dims × 5 = 75
+  last_action                  : 15 dims × 5 = 75
+  [gait_phase]                 : 2 dims  × 5 = 10  (optional)
+  Total: 270 / 285 / 295 / 305 depending on optional tokens
 
 Joint order (TRAIN_JOINT_NAMES resolved from URDF):
   0: left_hip_pitch     6: right_hip_pitch    12: waist_yaw
@@ -24,6 +26,7 @@ Left-right mirror (sagittal plane reflection, y → -y):
   - Negate ang_vel x,z  (pseudovector under y-reflection)
   - Negate gravity y
   - Negate vel_cmd y, wz
+  - Preserve reward-regime and gait-mode tokens (mode partition is reflection-invariant)
   - Negate gait_phase (phase shift by π)
 """
 
@@ -103,7 +106,10 @@ def _mirror_policy_obs(env: ManagerBasedRLEnv, obs: torch.Tensor) -> torch.Tenso
     device = obs.device
 
     _jsign = torch.tensor(JOINT_MIRROR_SIGN, dtype=obs.dtype, device=device)
-    has_gait_phase = "gait_phase" in env.observation_manager.active_terms["policy"]
+    active_terms = env.observation_manager.active_terms["policy"]
+    has_lin_speed_reward_regime_token = "lin_speed_reward_regime_token" in active_terms
+    has_gait_mode_token_3 = "gait_mode_token_3" in active_terms
+    has_gait_phase = "gait_phase" in active_terms
 
     idx = 0
     # base_ang_vel  (3 × H)
@@ -120,6 +126,14 @@ def _mirror_policy_obs(env: ManagerBasedRLEnv, obs: torch.Tensor) -> torch.Tenso
     obs[:, idx:idx + 3 * H] = _mirror_block(
         obs[:, idx:idx + 3 * H], 3, sign=torch.tensor([1, -1, -1], dtype=obs.dtype, device=device))
     idx += 3 * H
+
+    # lin_speed_reward_regime_token  (2 × H) — reflection-invariant
+    if has_lin_speed_reward_regime_token:
+        idx += 2 * H
+
+    # gait_mode_token_3  (3 × H) — reflection-invariant
+    if has_gait_mode_token_3:
+        idx += 3 * H
 
     # joint_pos_rel  (15 × H)
     obs[:, idx:idx + 15 * H] = _mirror_block(

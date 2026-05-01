@@ -349,6 +349,33 @@ class G115DofTransformerAuxPPORunnerCfg(BasePPORunnerCfg):
     )
 
 
+@configclass
+class RslRlTransformerLatentModelCfg(RslRlTransformerModelCfg):
+    class_name: str = "unitree_rl_lab.utils.rsl_rl_transformer_model:TransformerLatentModel"
+    velocity_pred_dim: int = 3
+    enable_aux_loss: bool = False
+
+
+@configclass
+class G115DofV21dTransformerLatentPPORunnerCfg(BasePPORunnerV3Cfg):
+    actor = RslRlTransformerLatentModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        history_len=5,
+        history_start_idx=0,
+        history_obs_dim=54,
+        aux_start_idx=216,
+        aux_obs_dim=54,
+        d_model=256,
+        n_heads=4,
+        encoder_num_layers=2,
+        encoder_dim_feedforward=512,
+        velocity_pred_dim=3,
+        enable_aux_loss=False,
+    )
+
+
 # ---- Contrastive Latent Policy (CLP) ----
 
 @configclass

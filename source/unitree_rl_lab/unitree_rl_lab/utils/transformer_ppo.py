@@ -1,17 +1,12 @@
-"""PPO with auxiliary next-observation prediction loss for Transformer actor.
+"""PPO with transformer latent auxiliary objectives.
 
-The auxiliary loss provides a direct self-supervised gradient signal to the
-Transformer encoder, compensating for the weak indirect gradient that PPO's
-policy loss provides.  The actor's ``predict_next_obs`` method produces a
-predicted next observation frame, which is compared against the *actual*
-next observation frame via MSE.
-
-The auxiliary coefficient supports an optional linear decay schedule so that
-early training is dominated by representation learning while later training
-focuses on policy optimisation.
+Supports optional next-observation prediction and explicit velocity regression
+on top of a history encoder.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -28,7 +23,7 @@ from unitree_rl_lab.utils.rsl_rl_custom_ppo import _sanitize_model_cfg
 
 
 class TransformerPPO(PPO):
-    """PPO with an auxiliary next-obs prediction loss on the Transformer actor."""
+    """PPO with transformer latent auxiliary losses."""
 
     def __init__(
         self,
@@ -38,24 +33,18 @@ class TransformerPPO(PPO):
         *,
         aux_loss_coef: float = 0.5,
         aux_loss_schedule: list[float] | None = None,
+        velocity_aux_coef: float = 0.0,
+        achieved_ang_vel_scale: float = 0.2,
         **kwargs,
     ) -> None:
         super().__init__(actor, critic, storage, **kwargs)
         self.aux_loss_coef = aux_loss_coef
         self.aux_loss_schedule = list(aux_loss_schedule) if aux_loss_schedule is not None else None
+        self.velocity_aux_coef = float(velocity_aux_coef)
+        self.achieved_ang_vel_scale = float(achieved_ang_vel_scale)
         self.counter = 0
 
-    # ------------------------------------------------------------------
-    # Aux coefficient schedule
-    # ------------------------------------------------------------------
-
     def _get_aux_coef(self) -> float:
-        """Return current aux loss coefficient, optionally with linear decay.
-
-        Schedule format: ``[start, end, decay_start_iter, decay_steps]``
-        e.g. ``[0.5, 0.05, 0, 5000]`` decays linearly from 0.5 to 0.05 over
-        the first 5000 update calls.
-        """
         if self.aux_loss_schedule is None:
             return self.aux_loss_coef
 
@@ -69,75 +58,109 @@ class TransformerPPO(PPO):
         progress = min(max((self.counter - decay_start), 0) / decay_steps, 1.0)
         return float(start + progress * (end - start))
 
-    # ------------------------------------------------------------------
-    # Auxiliary loss computation (dedicated pass over storage)
-    # ------------------------------------------------------------------
+    def _flatten_obs(self, obs: TensorDict, obs_groups: list[str]) -> torch.Tensor:
+        return torch.cat([obs[k] for k in obs_groups], dim=-1)
 
-    def _flatten_obs(self, obs: TensorDict) -> torch.Tensor:
-        """Flatten a TensorDict observation using the actor's obs_groups ordering."""
-        parts = [obs[k] for k in self.actor.obs_groups]
-        return torch.cat(parts, dim=-1)
+    def _get_achieved_velocity_targets(self, obs_t: TensorDict) -> torch.Tensor:
+        critic_flat = self._flatten_obs(obs_t, self.critic.obs_groups)
+        critic_single_dim = critic_flat.shape[-1] // self.actor.history_len
+        critic_frames = critic_flat.view(-1, self.actor.history_len, critic_single_dim)
+        last_critic = critic_frames[:, -1, :]
+        inv_ang_scale = 1.0 / max(self.achieved_ang_vel_scale, 1e-6)
+        return torch.stack(
+            [
+                last_critic[:, 0],
+                last_critic[:, 1],
+                last_critic[:, 5] * inv_ang_scale,
+            ],
+            dim=-1,
+        )
 
-    def _compute_aux_prediction_loss(self) -> torch.Tensor:
-        """Compute next-obs prediction loss over the full rollout buffer.
-
-        For each step t in [0, T-2], the actor encodes obs[t] and predicts
-        the next observation frame.  The target is the *last history frame*
-        from obs[t+1] (after normalisation).
-        """
+    def _compute_aux_losses(self, aux_coef: float) -> dict[str, torch.Tensor]:
         T = self.storage.num_transitions_per_env
         if T < 2:
-            return torch.tensor(0.0, device=self.device)
+            zero = torch.tensor(0.0, device=self.device)
+            return {
+                "next_obs": zero,
+                "velocity": zero,
+            }
 
         history_obs_dim: int = self.actor.history_obs_dim  # type: ignore[attr-defined]
         history_start_idx: int = self.actor.history_start_idx  # type: ignore[attr-defined]
         history_total_dim: int = self.actor.history_total_dim  # type: ignore[attr-defined]
         last_frame_start = history_start_idx + history_total_dim - history_obs_dim
 
-        total_loss = torch.tensor(0.0, device=self.device)
+        next_obs_loss_sum = 0.0
+        velocity_loss_sum = 0.0
+        self.optimizer.zero_grad()
         for t in range(T - 1):
             obs_t = self.storage.observations[t]
             obs_next = self.storage.observations[t + 1]
 
-            # Actor forward: encode obs_t → latent → predict next frame
-            _, predicted = self.actor.predict_next_obs(obs_t)
+            outputs = self.actor.get_latent_outputs(obs_t)
+            step_aux_loss = torch.tensor(0.0, device=self.device)
 
-            # Target: last history frame from obs_{t+1}  (with normalisation)
-            with torch.no_grad():
-                flat_next = self._flatten_obs(obs_next)
-                flat_next = self.actor.obs_normalizer(flat_next)
-                target = flat_next[:, last_frame_start : last_frame_start + history_obs_dim]
+            if getattr(self.actor, "enable_aux_loss", False) and aux_coef > 0.0:
+                predicted_next = outputs["predicted_next_obs"]
+                with torch.no_grad():
+                    flat_next = self._flatten_obs(obs_next, self.actor.obs_groups)
+                    flat_next = self.actor.obs_normalizer(flat_next)
+                    target_next = flat_next[:, last_frame_start : last_frame_start + history_obs_dim]
+                next_obs_loss = nn.functional.mse_loss(predicted_next, target_next)
+                step_aux_loss = step_aux_loss + aux_coef * next_obs_loss
+                next_obs_loss_sum += next_obs_loss.item()
 
-            total_loss = total_loss + nn.functional.mse_loss(predicted, target)
+            if self.velocity_aux_coef > 0.0:
+                achieved_t = self._get_achieved_velocity_targets(obs_t)
+                velocity_loss = nn.functional.smooth_l1_loss(outputs["velocity_pred"], achieved_t)
+                step_aux_loss = step_aux_loss + self.velocity_aux_coef * velocity_loss
+                velocity_loss_sum += velocity_loss.item()
 
-        return total_loss / (T - 1)
+            if step_aux_loss.requires_grad:
+                (step_aux_loss / (T - 1)).backward()
 
-    # ------------------------------------------------------------------
-    # Main update
-    # ------------------------------------------------------------------
+        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+
+        denom = T - 1
+        return {
+            "next_obs": torch.tensor(next_obs_loss_sum / denom, device=self.device),
+            "velocity": torch.tensor(velocity_loss_sum / denom, device=self.device),
+        }
+
+    def _get_actor_critic_outputs(
+        self,
+        batch_obs: TensorDict,
+        masks: torch.Tensor | None,
+        hidden_states: tuple | list | None,
+        stochastic_output: bool,
+    ) -> tuple[tuple, torch.Tensor, torch.Tensor]:
+        actor_hidden_state = hidden_states[0] if hidden_states is not None else None
+        critic_hidden_state = hidden_states[1] if hidden_states is not None else None
+        self.actor(
+            batch_obs,
+            masks=masks,
+            hidden_state=actor_hidden_state,
+            stochastic_output=stochastic_output,
+        )
+        values = self.critic(batch_obs, masks=masks, hidden_state=critic_hidden_state)
+        distribution_params = self.actor.output_distribution_params
+        entropy = self.actor.output_entropy
+        return distribution_params, values, entropy
 
     def update(self) -> dict[str, float]:
-        """PPO update with optional auxiliary next-obs prediction loss.
-
-        The auxiliary loss is computed in a **dedicated forward-backward pass**
-        over the full rollout buffer, separate from the PPO mini-batch loop.
-        This avoids index-alignment issues with the shuffled mini-batch
-        generator and keeps the two objective gradients cleanly separated.
-        """
         aux_coef = self._get_aux_coef()
-        has_aux = getattr(self.actor, "enable_aux_loss", False) and aux_coef > 0.0
+        has_next_obs_aux = getattr(self.actor, "enable_aux_loss", False) and aux_coef > 0.0
+        has_velocity_aux = self.velocity_aux_coef > 0.0
 
-        # ===================== Auxiliary prediction pass =====================
         mean_aux_loss = 0.0
-        if has_aux:
-            aux_loss = self._compute_aux_prediction_loss()
-            self.optimizer.zero_grad()
-            (aux_coef * aux_loss).backward()
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            mean_aux_loss = aux_loss.item()
+        mean_velocity_aux_loss = 0.0
 
-        # ===================== Standard PPO update ===========================
+        if has_next_obs_aux or has_velocity_aux:
+            losses = self._compute_aux_losses(aux_coef)
+            mean_aux_loss = losses["next_obs"].item()
+            mean_velocity_aux_loss = losses["velocity"].item()
+
         mean_value_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_entropy = 0.0
@@ -176,23 +199,16 @@ class TransformerPPO(PPO):
                 batch.advantages = batch.advantages.repeat(num_aug, 1)
                 batch.returns = batch.returns.repeat(num_aug, 1)
 
-            # --- Standard PPO forward ---
-            self.actor(
+            distribution_params, values, entropy = self._get_actor_critic_outputs(
                 batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
+                batch.masks,
+                batch.hidden_states,
                 stochastic_output=True,
             )
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)
-            values = self.critic(
-                batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1]
-            )
-            distribution_params = tuple(
-                p[:original_batch_size] for p in self.actor.output_distribution_params
-            )
-            entropy = self.actor.output_entropy[:original_batch_size]
+            distribution_params = tuple(p[:original_batch_size] for p in distribution_params)
+            entropy = entropy[:original_batch_size]
 
-            # --- Adaptive LR ---
             if self.desired_kl is not None and self.schedule == "adaptive":
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(
@@ -214,7 +230,6 @@ class TransformerPPO(PPO):
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # --- Surrogate loss ---
             ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))
             surrogate = -torch.squeeze(batch.advantages) * ratio
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(
@@ -222,7 +237,6 @@ class TransformerPPO(PPO):
             )
             surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
 
-            # --- Value loss ---
             if self.use_clipped_value_loss:
                 value_clipped = batch.values + (values - batch.values).clamp(
                     -self.clip_param, self.clip_param
@@ -233,14 +247,12 @@ class TransformerPPO(PPO):
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            # --- Total PPO loss ---
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy.mean()
             )
 
-            # --- Symmetry ---
             if self.symmetry:
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 if not self.symmetry["use_data_augmentation"]:
@@ -261,7 +273,6 @@ class TransformerPPO(PPO):
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
-            # --- RND ---
             if self.rnd:
                 with torch.no_grad():
                     rnd_state = self.rnd.get_rnd_state(batch.observations[:original_batch_size])
@@ -270,7 +281,6 @@ class TransformerPPO(PPO):
                 target_embedding = self.rnd.target(rnd_state).detach()
                 rnd_loss = torch.nn.MSELoss()(predicted_embedding, target_embedding)
 
-            # --- Backward ---
             self.optimizer.zero_grad()
             loss.backward()
             if self.rnd:
@@ -310,6 +320,7 @@ class TransformerPPO(PPO):
             "entropy": mean_entropy,
             "aux_pred": mean_aux_loss,
             "aux_coef": aux_coef,
+            "velocity_aux": mean_velocity_aux_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
@@ -317,13 +328,9 @@ class TransformerPPO(PPO):
             loss_dict["symmetry"] = mean_symmetry_loss
         return loss_dict
 
-    # ------------------------------------------------------------------
-    # Factory
-    # ------------------------------------------------------------------
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> PPO:
-        """Construct TransformerPPO (Transformer actor + MLP critic)."""
         alg_class: type[PPO] = resolve_callable(cfg["algorithm"].pop("class_name"))
         actor_class: type[MLPModel] = resolve_callable(cfg["actor"].pop("class_name"))
         critic_class: type[MLPModel] = resolve_callable(cfg["critic"].pop("class_name"))

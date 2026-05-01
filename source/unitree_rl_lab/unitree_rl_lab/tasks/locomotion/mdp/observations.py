@@ -166,3 +166,31 @@ def gait_mode_token_3(
 
     token = torch.stack([standing, pure_wz, other], dim=-1)
     return token.float()
+
+
+def _smoothstep(x: torch.Tensor) -> torch.Tensor:
+    return x * x * (3.0 - 2.0 * x)
+
+
+def lin_speed_reward_regime_token(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    std: float = 0.5,
+    threshold_scale: float = 1.567,
+    transition_width: float = 0.05,
+    lin_cmd_min: float = 0.05,
+) -> torch.Tensor:
+    cmd = env.command_manager.get_command(command_name)
+    cmd_lin = torch.norm(cmd[:, :2], dim=1)
+
+    threshold = threshold_scale * std
+    if transition_width <= 0.0:
+        exp_weight = (cmd_lin >= threshold).float()
+    else:
+        lo = threshold - transition_width
+        hi = threshold + transition_width
+        alpha = ((cmd_lin - lo) / max(hi - lo, 1e-6)).clamp(0.0, 1.0)
+        exp_weight = _smoothstep(alpha)
+    exp_weight = torch.where(cmd_lin < lin_cmd_min, torch.ones_like(exp_weight), exp_weight)
+    low_speed_weight = 1.0 - exp_weight
+    return torch.stack([low_speed_weight, exp_weight], dim=-1)

@@ -4,6 +4,7 @@
 #include "isaaclab/envs/mdp/observations/observations.h"
 #include "isaaclab/envs/mdp/actions/joint_actions.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace isaaclab
@@ -13,6 +14,34 @@ REGISTER_OBSERVATION(velocity_commands)
 {
     const auto cmd = g_keyboard_teleop.command();
     return std::vector<float>{cmd[0], cmd[1], cmd[2]};
+}
+
+REGISTER_OBSERVATION(lin_speed_reward_regime_token)
+{
+    const auto cmd = g_keyboard_teleop.command();
+    const float std = params["std"] ? params["std"].as<float>() : 0.5f;
+    const float threshold_scale = params["threshold_scale"] ? params["threshold_scale"].as<float>() : 1.567f;
+    const float transition_width = params["transition_width"] ? params["transition_width"].as<float>() : 0.05f;
+    const float lin_cmd_min = params["lin_cmd_min"] ? params["lin_cmd_min"].as<float>() : 0.05f;
+
+    const float cmd_lin = std::sqrt(cmd[0] * cmd[0] + cmd[1] * cmd[1]);
+    const float threshold = threshold_scale * std;
+
+    float exp_weight = 0.0f;
+    if (transition_width <= 0.0f) {
+        exp_weight = cmd_lin >= threshold ? 1.0f : 0.0f;
+    } else {
+        const float lo = threshold - transition_width;
+        const float hi = threshold + transition_width;
+        const float denom = std::max(hi - lo, 1e-6f);
+        const float alpha = std::max(0.0f, std::min((cmd_lin - lo) / denom, 1.0f));
+        exp_weight = alpha * alpha * (3.0f - 2.0f * alpha);
+    }
+    if (cmd_lin < lin_cmd_min) {
+        exp_weight = 1.0f;
+    }
+    const float low_speed_weight = 1.0f - exp_weight;
+    return std::vector<float>{low_speed_weight, exp_weight};
 }
 
 // V20a: 5-mode one-hot gait token (standing/pure_vx/pure_vy/pure_wz/joint).

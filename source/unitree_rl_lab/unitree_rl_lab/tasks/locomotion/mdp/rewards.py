@@ -525,6 +525,88 @@ def low_speed_tracking_bonus(
     return accuracy * mask.float()
 
 
+def _smoothstep(x: torch.Tensor) -> torch.Tensor:
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _hybrid_reward_regime_weights(
+    cmd_mag: torch.Tensor,
+    std: float,
+    threshold_scale: float,
+    transition_width: float,
+    cmd_min: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    threshold = threshold_scale * std
+    if transition_width <= 0.0:
+        exp_weight = (cmd_mag >= threshold).float()
+    else:
+        lo = threshold - transition_width
+        hi = threshold + transition_width
+        alpha = ((cmd_mag - lo) / max(hi - lo, 1e-6)).clamp(0.0, 1.0)
+        exp_weight = _smoothstep(alpha)
+    exp_weight = torch.where(cmd_mag < cmd_min, torch.ones_like(exp_weight), exp_weight)
+    low_speed_weight = 1.0 - exp_weight
+    return low_speed_weight, exp_weight
+
+
+def track_lin_vel_xy_hybrid_low_speed(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    threshold_scale: float = 1.567,
+    transition_width: float = 0.05,
+    lin_cmd_min: float = 0.05,
+    rel_floor: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+
+    cmd_lin = torch.norm(cmd, dim=1)
+    err_lin = torch.norm(cmd - vel, dim=1)
+
+    r_exp = torch.exp(-err_lin.square() / std**2)
+    r_rel = torch.clamp(1.0 - err_lin / cmd_lin.clamp(min=rel_floor), min=0.0, max=1.0)
+    low_speed_weight, exp_weight = _hybrid_reward_regime_weights(
+        cmd_mag=cmd_lin,
+        std=std,
+        threshold_scale=threshold_scale,
+        transition_width=transition_width,
+        cmd_min=lin_cmd_min,
+    )
+    return exp_weight * r_exp + low_speed_weight * r_rel
+
+
+def track_ang_vel_z_hybrid_low_speed(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    threshold_scale: float = 1.567,
+    transition_width: float = 0.05,
+    ang_cmd_min: float = 0.05,
+    rel_floor: float = 0.05,
+) -> torch.Tensor:
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    cmd_yaw_abs = cmd_yaw.abs()
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    err_yaw = (actual_yaw - cmd_yaw).abs()
+
+    r_exp = torch.exp(-err_yaw.square() / std**2)
+    r_rel = torch.clamp(1.0 - err_yaw / cmd_yaw_abs.clamp(min=rel_floor), min=0.0, max=1.0)
+    low_speed_weight, exp_weight = _hybrid_reward_regime_weights(
+        cmd_mag=cmd_yaw_abs,
+        std=std,
+        threshold_scale=threshold_scale,
+        transition_width=transition_width,
+        cmd_min=ang_cmd_min,
+    )
+    return exp_weight * r_exp + low_speed_weight * r_rel
+
+
 def low_speed_rotation_bonus(
     env: ManagerBasedRLEnv,
     command_name: str = "base_velocity",
@@ -694,6 +776,11 @@ def track_ang_vel_z_baselined(
     return torch.where(is_straight_walk, torch.zeros_like(result), result)
 
 
+def _linear_step_decay(env: ManagerBasedRLEnv, end_step: int, start_step: int = 0) -> float:
+    progress = (env.common_step_counter - start_step) / max(end_step - start_step, 1)
+    return max(0.0, min(1.0 - progress, 1.0))
+
+
 def feet_gait_speed_scaled(
     env: ManagerBasedRLEnv,
     period: float,
@@ -735,6 +822,50 @@ def foot_clearance_speed_scaled(
     cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
     gate = torch.clamp(cmd_norm / speed_gate, 0.0, 1.0)
     return base_reward * gate
+
+
+def feet_gait_speed_scaled_decayed(
+    env: ManagerBasedRLEnv,
+    period: float,
+    offset: list[float],
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    command_name: str,
+    speed_gate: float = 0.3,
+    end_step: int = 2000,
+    start_step: int = 0,
+) -> torch.Tensor:
+    return feet_gait_speed_scaled(env, period, offset, sensor_cfg, threshold, command_name, speed_gate) * _linear_step_decay(
+        env, end_step=end_step, start_step=start_step
+    )
+
+
+def foot_clearance_speed_scaled_decayed(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    target_height: float,
+    std: float,
+    tanh_mult: float,
+    command_name: str = "base_velocity",
+    speed_gate: float = 0.3,
+    end_step: int = 2000,
+    start_step: int = 0,
+) -> torch.Tensor:
+    return foot_clearance_speed_scaled(
+        env, asset_cfg, target_height, std, tanh_mult, command_name=command_name, speed_gate=speed_gate
+    ) * _linear_step_decay(env, end_step=end_step, start_step=start_step)
+
+
+def rotation_single_support_reward_decayed(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    end_step: int = 2000,
+    start_step: int = 0,
+) -> torch.Tensor:
+    return rotation_single_support_reward(env, command_name, sensor_cfg) * _linear_step_decay(
+        env, end_step=end_step, start_step=start_step
+    )
 
 
 # ============================================================================

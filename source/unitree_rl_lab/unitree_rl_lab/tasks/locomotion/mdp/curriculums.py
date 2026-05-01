@@ -299,7 +299,7 @@ def marginal_vel_curriculum(
     reward_term_name: str = "track_lin_vel_xy",
     range_expand_threshold: float = 0.3,
     min_perf_floor: float = 0.2,
-) -> torch.Tensor:
+) -> dict[str, float]:
     """Companion curriculum for MarginalVelocityCommand.
 
     Per-direction expansion using mean(perf) instead of min(perf).
@@ -307,9 +307,15 @@ def marginal_vel_curriculum(
     Extra gate: no expansion if ANY active bin has perf < min_perf_floor
     (ensures no "completely non-responsive" bins exist before expanding).
 
-    Returns the minimum of per-direction mean perfs as a curriculum metric.
+    Returns structured curriculum metrics for persistent logging.
     """
     command_term = env.command_manager.get_term("base_velocity")
+
+    def _build_log_payload(min_mean_value: float) -> dict[str, float]:
+        payload = {"min_mean": float(min_mean_value)}
+        if hasattr(command_term, 'get_diagnostic_log_data'):
+            payload.update(command_term.get_diagnostic_log_data())
+        return payload
 
     # Feed accuracy data at every reset
     if len(env_ids) > 0 and hasattr(command_term, 'get_episode_accuracy'):
@@ -331,12 +337,16 @@ def marginal_vel_curriculum(
                         perfs.append(command_term._vy_perf[t].mean().item())
                     else:
                         perfs.append(command_term._wz_perf[t].mean().item())
-            return torch.tensor(min(perfs) if perfs else 0.5, device=env.device, dtype=torch.float32)
-        return torch.tensor(0.5, device=env.device)
+            return _build_log_payload(min(perfs) if perfs else 0.5)
+        return _build_log_payload(0.5)
 
     # --- Evaluation gate (every max_episode_length steps) ---
     if not hasattr(command_term, '_vx_perf'):
-        return torch.tensor(0.5, device=env.device, dtype=torch.float32)
+        return _build_log_payload(0.5)
+
+    diagnostic_log_data = {}
+    if hasattr(command_term, 'get_diagnostic_log_data'):
+        diagnostic_log_data = command_term.get_diagnostic_log_data()
 
     # Log bin stats
     if hasattr(command_term, 'log_sampling_stats'):
@@ -379,4 +389,8 @@ def marginal_vel_curriculum(
                 )
 
     min_mean = min(dir_means.values()) if dir_means else 0.5
-    return torch.tensor(min_mean, device=env.device, dtype=torch.float32)
+    payload = {"min_mean": float(min_mean)}
+    payload.update(diagnostic_log_data)
+    if hasattr(command_term, 'reset_diagnostic_log_data'):
+        command_term.reset_diagnostic_log_data()
+    return payload

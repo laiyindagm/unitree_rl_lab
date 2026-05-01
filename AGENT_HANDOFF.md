@@ -548,3 +548,22 @@ The project is trying to satisfy three competing behaviors:
 Latest insight: pure_vx/pure_vy fail because they are `cmd_wz=0` samples that previously got no real yaw supervision. Joint commands often include nonzero yaw and therefore train a better yaw controller. The correct direction is to keep meaningful mode isolation while making pure_xy reward supply real yaw-stability gradients.
 
 V20l is designed to test exactly that.
+
+## V20l Full-Speed Milestone
+
+User-confirmed milestone: V20l successfully achieved sensitive and stable response across the full velocity command range in sim2sim, including pure vx/vy and combined commands.
+
+Current active config:
+
+```text
+Unitree-G1-15dof-Velocity-Rot-V20l
+```
+
+Key interpretation:
+
+- V20l = V20g rewards + V20j observations.
+- It keeps the required 3-way mode isolation `{standing, pure_wz, other}`.
+- It restores standard yaw supervision with `track_ang_vel_z_exp`, fixing the pure_xy cmd_wz=0 missing-gradient problem.
+- Do not treat token removal as the default fix. V20i no-token regressed; V20j 3-mode token failed until yaw skip was removed.
+- Detailed milestone, lessons, ablation matrix, and future V21/V22/V23 plan are recorded in `V20L_MILESTONE_AND_ROADMAP.md`.
+
