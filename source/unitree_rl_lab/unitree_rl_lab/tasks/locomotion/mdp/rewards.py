@@ -1184,3 +1184,388 @@ def stand_still_scheduled(
     cmd_norm = torch.norm(env.command_manager.get_command(command_name), dim=1)
     return schedule * reward * (cmd_norm < 0.1).float()
 
+
+
+# ---------------------------------------------------------------------------
+# V21g: full-velocity-space relative-error linear tracking
+# ---------------------------------------------------------------------------
+# Replaces the exp(-||err||^2 / std^2) kernel with a piecewise linear form
+#     r = clamp(1 - ||err|| / max(||cmd||, b_abs), 0, 1)
+# where b_abs = LINEAR_REL_B_RATIO * std (LINEAR_REL_B_RATIO = 1.5670...).
+#
+# Derivation: solve for b such that exp(-x^2/std^2) >= 1 - x/b for all x>=0.
+# Tangency condition (2v+1)*exp(-v) = 1 with v = (x/std)^2 gives v* ~= 1.25643,
+# so b = std * exp(v*) / (2*sqrt(v*)) ~= 1.5670 * std. At |cmd| >= b_abs the
+# divisor is |cmd| (the "relative" form); below that it is b_abs (the
+# absolute "1 - |x|/b" form), which is exactly what the V21g spec requires
+# at cmd = 0 and continuously extends inward.
+
+LINEAR_REL_B_RATIO = 1.5669  # std-multiplier solving (2v+1)e^-v = 1 (=1.56697...; truncated DOWN to keep g <= f strictly)
+
+
+def track_lin_vel_xy_relative_full(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Linear xy-velocity tracking using relative-error linear form everywhere.
+
+    r = clamp(1 - |err| / max(|cmd|, b_abs), 0, 1),   b_abs = 1.5670 * std.
+    Provably <= exp(-|err|^2 / std^2) for every (cmd, err) pair.
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    err = torch.norm(cmd - vel, dim=1)
+    cmd_mag = torch.norm(cmd, dim=1)
+    b_abs = LINEAR_REL_B_RATIO * std
+    denom = torch.clamp(cmd_mag, min=b_abs)
+    return torch.clamp(1.0 - err / denom, min=0.0, max=1.0)
+
+
+def track_ang_vel_z_relative_full(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+) -> torch.Tensor:
+    """Yaw-rate tracking using relative-error linear form everywhere.
+
+    r = clamp(1 - |err| / max(|cmd|, b_abs), 0, 1),   b_abs = 1.5670 * std.
+    Provably <= exp(-|err|^2 / std^2) for every (cmd, err) pair.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    cmd_yaw_abs = cmd_yaw.abs()
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    err = (actual_yaw - cmd_yaw).abs()
+    b_abs = LINEAR_REL_B_RATIO * std
+    denom = torch.clamp(cmd_yaw_abs, min=b_abs)
+    return torch.clamp(1.0 - err / denom, min=0.0, max=1.0)
+
+
+# ---------------------------------------------------------------------------
+# V21i: STRICT piecewise tracking matching the user spec
+# ---------------------------------------------------------------------------
+#   |cmd| < cmd_eps :  r = clamp(1 - |v|     / b_abs,   0, 1)        (cmd=0 case)
+#   |cmd| >= cmd_eps:  r = clamp(1 - |v-cmd| / |cmd|,   0, 1)        (cmd>0 case)
+# where b_abs = LINEAR_REL_B_RATIO * std (so r <= exp(-|err|^2/std^2) for cmd=0).
+#
+# Differs from V21g: NO max(|cmd|, b) interpolation; denom drops to |cmd| as
+# soon as |cmd| > cmd_eps. Restores dead zones (err > |cmd| -> r = 0) for
+# nonzero cmd, exactly as in the literal spec.
+
+PIECEWISE_CMD_EPS = 1.0e-3  # below this |cmd| is treated as zero
+
+
+def track_lin_vel_xy_piecewise_strict(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    cmd_eps: float = PIECEWISE_CMD_EPS,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Strict piecewise linear tracking per V21i spec (xy linear).
+
+    cmd=0 branch: r = 1 - |v|/b         with b = LINEAR_REL_B_RATIO * std
+    cmd>0 branch: r = 1 - |v-cmd|/|cmd|  (no floor; can be negative -> clamp 0)
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    cmd_mag = torch.norm(cmd, dim=1)
+    err = torch.norm(cmd - vel, dim=1)
+    vel_mag = torch.norm(vel, dim=1)
+    b_abs = LINEAR_REL_B_RATIO * std
+
+    is_zero = cmd_mag < cmd_eps
+    r_zero = 1.0 - vel_mag / b_abs
+    # avoid div-by-zero on the masked-out branch by using clamped denom
+    r_pos = 1.0 - err / cmd_mag.clamp(min=cmd_eps)
+    r = torch.where(is_zero, r_zero, r_pos)
+    return torch.clamp(r, min=0.0, max=1.0)
+
+
+def track_ang_vel_z_piecewise_strict(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    cmd_eps: float = PIECEWISE_CMD_EPS,
+) -> torch.Tensor:
+    """Strict piecewise linear tracking per V21i spec (yaw rate)."""
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    cmd_yaw_abs = cmd_yaw.abs()
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    err = (actual_yaw - cmd_yaw).abs()
+    actual_abs = actual_yaw.abs()
+    b_abs = LINEAR_REL_B_RATIO * std
+
+    is_zero = cmd_yaw_abs < cmd_eps
+    r_zero = 1.0 - actual_abs / b_abs
+    r_pos = 1.0 - err / cmd_yaw_abs.clamp(min=cmd_eps)
+    r = torch.where(is_zero, r_zero, r_pos)
+    return torch.clamp(r, min=0.0, max=1.0)
+
+
+# ---------------------------------------------------------------------------
+# V21j: STRICT piecewise tracking with LEAKY negative tail (no dead zone)
+# ---------------------------------------------------------------------------
+# Same denominator structure as V21i (literal user spec):
+#   |cmd| < cmd_eps :  raw = 1 - |v|     / b_abs
+#   |cmd| >= cmd_eps:  raw = 1 - |v-cmd| / |cmd|
+# Replace V21i's clamp(0, 1) with a LEAKY mapping on the negative side:
+#   r = raw                  if raw >= 0
+#       slope_neg * raw      if raw <  0   (default slope_neg = 0.1)
+#   then capped at <= 1 from above (raw never exceeds 1 anyway since |err|>=0).
+# Effect:
+#   - raw >= 0 region:  identical to V21i (gradient -1/denom)
+#   - raw <  0 region:  no longer dead; gradient -slope_neg/denom (small but nonzero)
+#   - At |cmd| ~ 0.1 and err = 2*|cmd|, r = -1 * 0.1 = -0.1, comparable in
+#     magnitude to alive_reward (~+0.15/step), so policy is NOT incentivised
+#     to terminate early.
+
+LEAKY_SLOPE_NEG_DEFAULT = 0.1
+
+
+def _leaky_below_zero(raw: torch.Tensor, slope_neg: float) -> torch.Tensor:
+    """raw if raw>=0 else slope_neg*raw. Upper-cap at 1.0 (raw is already <=1)."""
+    pos = torch.clamp(raw, min=0.0)
+    neg = slope_neg * torch.clamp(raw, max=0.0)
+    return torch.clamp(pos + neg, max=1.0)
+
+
+def track_lin_vel_xy_piecewise_leaky(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    cmd_eps: float = PIECEWISE_CMD_EPS,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """V21j xy-tracking: V21i denominator + leaky negative tail."""
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    cmd_mag = torch.norm(cmd, dim=1)
+    err = torch.norm(cmd - vel, dim=1)
+    vel_mag = torch.norm(vel, dim=1)
+    b_abs = LINEAR_REL_B_RATIO * std
+
+    is_zero = cmd_mag < cmd_eps
+    raw_zero = 1.0 - vel_mag / b_abs
+    raw_pos = 1.0 - err / cmd_mag.clamp(min=cmd_eps)
+    raw = torch.where(is_zero, raw_zero, raw_pos)
+    return _leaky_below_zero(raw, slope_neg)
+
+
+def track_ang_vel_z_piecewise_leaky(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    cmd_eps: float = PIECEWISE_CMD_EPS,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+) -> torch.Tensor:
+    """V21j yaw-tracking: V21i denominator + leaky negative tail."""
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    cmd_yaw_abs = cmd_yaw.abs()
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    err = (actual_yaw - cmd_yaw).abs()
+    actual_abs = actual_yaw.abs()
+    b_abs = LINEAR_REL_B_RATIO * std
+
+    is_zero = cmd_yaw_abs < cmd_eps
+    raw_zero = 1.0 - actual_abs / b_abs
+    raw_pos = 1.0 - err / cmd_yaw_abs.clamp(min=cmd_eps)
+    raw = torch.where(is_zero, raw_zero, raw_pos)
+    return _leaky_below_zero(raw, slope_neg)
+
+
+# ------------------------------------------------------------------
+# V21k: constant-denominator leaky linear (validates the hypothesis
+# that the exp kernel is asymptotically equivalent to a fixed-slope
+# linear kernel with slope ~ -1/(LINEAR_REL_B_RATIO*std) plus a leaky
+# negative tail). For ALL cmd values:
+#       raw = 1 - |v - v_cmd| / b_abs        with b_abs = LINEAR_REL_B_RATIO*std
+#       r   = raw                if raw >= 0
+#             slope_neg * raw    if raw <  0
+# Worst-case stationary penalty per step (slope_neg=0.1):
+#   xy:  err <= ~3.0 -> raw ~= -2.85 -> r ~= -0.285  (weight 1.0  -> -0.285/step)
+#   yaw: err <= ~1.6 -> raw ~= -1.05 -> r ~= -0.105  (weight 3.0  -> -0.315/step)
+#   total worst case -0.6/step  vs alive_reward +0.15/step  -> safe.
+# ------------------------------------------------------------------
+
+
+def track_lin_vel_xy_constant_leaky(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """V21k xy-tracking: r = 1 - |v - v_cmd|/b_abs (leaky below 0).
+
+    Constant denominator b_abs = LINEAR_REL_B_RATIO * std for ALL cmd values
+    (no piecewise / no per-cmd scaling). This isolates the question of whether
+    a fixed slope -1/b_abs everywhere already matches the exp kernel.
+    """
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    err = torch.norm(cmd - vel, dim=1)
+    b_abs = LINEAR_REL_B_RATIO * std
+    b_abs = 1
+    raw = 1.0 - err / b_abs
+    return _leaky_below_zero(raw, slope_neg)
+
+
+def track_ang_vel_z_constant_leaky(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+) -> torch.Tensor:
+    """V21k yaw-tracking: r = 1 - |wz - wz_cmd|/b_abs (leaky below 0)."""
+    cmd = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    err = (actual_yaw - cmd_yaw).abs()
+    b_abs = LINEAR_REL_B_RATIO * std
+    b_abs = 1
+    raw = 1.0 - err / b_abs
+    return _leaky_below_zero(raw, slope_neg)
+
+
+# ------------------------------------------------------------------
+# V21l: LIRPG intrinsic tracking reward.
+# A small MLP r_phi(v, v_cmd) per channel is initialized to mimic the
+# V21k constant-leaky-linear baseline, then meta-updated online to
+# maximize task return = -|v - v_cmd|. See utils/intrinsic_reward.py.
+# ------------------------------------------------------------------
+
+
+def track_lin_vel_xy_intrinsic(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    meta_lr: float = 1e-4,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-3,
+    mono_coef: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """V21l xy-tracking via per-step MLP r_phi(v_xy, cmd_xy)."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    chan = ir.get_or_create(
+        "lin_xy",
+        feature_dim=4,
+        err_dim=2,
+        b=LINEAR_REL_B_RATIO * std,
+        slope_neg=slope_neg,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        mono_coef=mono_coef,
+        device=str(vel.device),
+    )
+    return chan.evaluate(vel, cmd)
+
+
+def track_ang_vel_z_intrinsic(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    meta_lr: float = 1e-4,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-3,
+    mono_coef: float = 0.0,
+) -> torch.Tensor:
+    """V21l yaw-tracking via per-step MLP r_phi(wz, wz_cmd)."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    cmd_yaw = env.command_manager.get_command(command_name)[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    chan = ir.get_or_create(
+        "ang_z",
+        feature_dim=2,
+        err_dim=1,
+        b=LINEAR_REL_B_RATIO * std,
+        slope_neg=slope_neg,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        mono_coef=mono_coef,
+        device=str(actual_yaw.device),
+    )
+    return chan.evaluate(actual_yaw, cmd_yaw)
+
+
+def track_lin_vel_xy_intrinsic_sigma(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sigma_0: float = 0.5,
+    meta_lr: float = 2e-5,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """V21m: xy-tracking via Gaussian r=exp(-e²/sigma(v_cmd)²) with learnable sigma."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    chan = ir.get_or_create_gauss(
+        "lin_xy_gauss",
+        err_dim=2,
+        sigma_0=sigma_0,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        device=str(vel.device),
+    )
+    return chan.evaluate(vel, cmd)
+
+
+def track_ang_vel_z_intrinsic_sigma(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sigma_0: float = 0.5,
+    meta_lr: float = 2e-5,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-1,
+) -> torch.Tensor:
+    """V21m: yaw-tracking via Gaussian r=exp(-e²/sigma(v_cmd)²) with learnable sigma."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    cmd_yaw = env.command_manager.get_command(command_name)[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    chan = ir.get_or_create_gauss(
+        "ang_z_gauss",
+        err_dim=1,
+        sigma_0=sigma_0,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        device=str(actual_yaw.device),
+    )
+    return chan.evaluate(actual_yaw, cmd_yaw)

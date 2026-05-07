@@ -216,6 +216,7 @@ class TransformerLatentModel(MLPModel):
         contrastive_dim: int = 32,
         num_contrastive_heads: int = 3,
         enable_aux_loss: bool = False,
+        detach_velocity_pred: bool = False,
     ) -> None:
         self.history_len = history_len
         self.history_start_idx = history_start_idx
@@ -223,6 +224,7 @@ class TransformerLatentModel(MLPModel):
         self.contrastive_target_obs_dim = contrastive_target_obs_dim
         self.contrastive_dim = contrastive_dim
         self.num_contrastive_heads = num_contrastive_heads
+        self.detach_velocity_pred = bool(detach_velocity_pred)
         self.history_latent_dim = 128
         self.flat_obs_dim = sum(int(obs[key].shape[-1]) for key in obs_groups[obs_set])
         self.latent_dim = self.flat_obs_dim + self.velocity_pred_dim
@@ -306,7 +308,11 @@ class TransformerLatentModel(MLPModel):
         return self.history_encoder(history_flat)
 
     def _build_policy_latent(self, flat_obs: torch.Tensor, velocity_pred: torch.Tensor) -> torch.Tensor:
-        return torch.cat([flat_obs, velocity_pred], dim=-1)
+        # Optionally detach so the downstream policy MLP does not back-propagate into
+        # the velocity estimator. The un-detached ``velocity_pred`` is still exposed
+        # in the outputs dict for the auxiliary supervised regression loss.
+        v_for_policy = velocity_pred.detach() if self.detach_velocity_pred else velocity_pred
+        return torch.cat([flat_obs, v_for_policy], dim=-1)
 
     def get_latent_outputs_from_flat(self, flat_obs: torch.Tensor) -> dict[str, torch.Tensor]:
         history, aux = self._split_from_flat(flat_obs)
@@ -428,6 +434,7 @@ class _TorchTransformerLatentModel(nn.Module):
         self.history_total_dim = model.history_total_dim
         self.aux_start_idx = model.aux_start_idx
         self.aux_obs_dim = model.aux_obs_dim
+        self.detach_velocity_pred = bool(model.detach_velocity_pred)
 
         self.history_encoder = copy.deepcopy(model.history_encoder)
         self.velocity_head = copy.deepcopy(model.velocity_head)
@@ -449,7 +456,8 @@ class _TorchTransformerLatentModel(nn.Module):
         history, _ = self._split_from_flat(x)
         history_latent = self.history_encoder(history.reshape(history.shape[0], -1))
         velocity_pred = self.velocity_head(history_latent)
-        out = self.mlp(torch.cat([x, velocity_pred], dim=-1))
+        v_for_policy = velocity_pred.detach() if self.detach_velocity_pred else velocity_pred
+        out = self.mlp(torch.cat([x, v_for_policy], dim=-1))
         return self.deterministic_output(out)
 
     @torch.jit.export
@@ -474,6 +482,7 @@ class _OnnxTransformerLatentModel(nn.Module):
         self.history_total_dim = model.history_total_dim
         self.aux_start_idx = model.aux_start_idx
         self.aux_obs_dim = model.aux_obs_dim
+        self.detach_velocity_pred = bool(model.detach_velocity_pred)
 
         self.history_encoder = copy.deepcopy(model.history_encoder)
         self.velocity_head = copy.deepcopy(model.velocity_head)
@@ -492,13 +501,14 @@ class _OnnxTransformerLatentModel(nn.Module):
         aux = flat_obs[:, self.aux_start_idx : self.aux_start_idx + self.aux_obs_dim]
         return history, aux
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.obs_normalizer(x)
         history, _ = self._split_from_flat(x)
         history_latent = self.history_encoder(history.reshape(history.shape[0], -1))
         velocity_pred = self.velocity_head(history_latent)
-        out = self.mlp(torch.cat([x, velocity_pred], dim=-1))
-        return self.deterministic_output(out)
+        v_for_policy = velocity_pred.detach() if self.detach_velocity_pred else velocity_pred
+        out = self.mlp(torch.cat([x, v_for_policy], dim=-1))
+        return self.deterministic_output(out), velocity_pred
 
     def get_dummy_inputs(self) -> tuple[torch.Tensor]:
         return (torch.zeros(1, self.input_size),)
@@ -509,7 +519,7 @@ class _OnnxTransformerLatentModel(nn.Module):
 
     @property
     def output_names(self) -> list[str]:
-        return ["actions"]
+        return ["actions", "velocity_pred"]
 
 
 class _OnnxTransformerHistoryModel(nn.Module):

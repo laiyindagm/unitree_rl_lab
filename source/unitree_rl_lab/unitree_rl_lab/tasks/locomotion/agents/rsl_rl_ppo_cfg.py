@@ -286,6 +286,8 @@ class RslRlTransformerAuxPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
 
     aux_loss_coef: float = 0.5
     aux_loss_schedule: list[float] | None = None  # [start, end, decay_start, decay_steps]
+    velocity_aux_coef: float = 0.0  # explicit MSE on actor velocity_head; 0 = disabled
+    achieved_ang_vel_scale: float = 0.2  # legacy: forwarded to TransformerPPO target extractor
 
 
 @configclass
@@ -354,6 +356,7 @@ class RslRlTransformerLatentModelCfg(RslRlTransformerModelCfg):
     class_name: str = "unitree_rl_lab.utils.rsl_rl_transformer_model:TransformerLatentModel"
     velocity_pred_dim: int = 3
     enable_aux_loss: bool = False
+    detach_velocity_pred: bool = False  # if True, policy MLP cannot back-prop into velocity head
 
 
 @configclass
@@ -374,6 +377,87 @@ class G115DofV21dTransformerLatentPPORunnerCfg(BasePPORunnerV3Cfg):
         velocity_pred_dim=3,
         enable_aux_loss=False,
     )
+
+
+# ---- V21e: corrected actor-side velocity estimator ----
+#
+# Differences vs the broken V21d setup:
+#   1. Algorithm class is `VelocityEstimatorPPO` (subclass of TransformerPPO)
+#      with corrected achieved-velocity target extraction. V21d used the
+#      default `UnitreePPO`, so its velocity head was never supervised.
+#   2. `velocity_aux_coef=1.0` enables the supervised regression of v_hat
+#      against the most-recent (base_lin_vel.x, .y, base_ang_vel.z) sample
+#      in the critic flat observation. The indices below assume the V21c
+#      CriticCfg term order: base_lin_vel(3) | base_ang_vel(3, scale=0.2) | ...
+#      with history_length=5 and term-major concatenation, so:
+#          base_lin_vel last-frame x = idx 12, y = idx 13
+#          base_ang_vel last-frame z = idx 29 (still scaled by 0.2)
+#      Inverse scale 1/0.2 = 5.0 recovers raw wz.
+#   3. `detach_velocity_pred=True` keeps the policy MLP from back-propagating
+#      into the velocity estimator, so v_hat is shaped purely by the
+#      supervised auxiliary loss and the actor uses it as a stationary
+#      learned proprioception feature.
+#   4. `history_obs_dim` is left to auto-compute (=58 for V21c policy obs);
+#      V21d hard-coded 54 which silently dropped a slice of the history.
+@configclass
+class RslRlVelocityEstimatorPpoAlgorithmCfg(RslRlTransformerAuxPpoAlgorithmCfg):
+    """Algorithm config for VelocityEstimatorPPO.
+
+    Fields beyond the parent class:
+        velocity_target_indices: indices into critic flat-obs for (vx, vy, wz).
+        velocity_target_scales:  per-component multiplier to undo CriticCfg
+                                 scaling (e.g. 1/0.2 = 5.0 for base_ang_vel.z).
+    """
+
+    velocity_target_indices: list[int] = [12, 13, 29]
+    velocity_target_scales: list[float] = [1.0, 1.0, 5.0]
+
+
+@configclass
+class G115DofV21eVelocityEstimatorPPORunnerCfg(BasePPORunnerV3Cfg):
+    """V21e: V21c env + actor-side detached velocity estimator with supervised aux loss."""
+
+    actor = RslRlTransformerLatentModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        history_len=5,
+        history_start_idx=0,
+        # V21c policy obs single-frame dim = 3+3+3+1+3+15+15+15 = 58
+        history_obs_dim=58,
+        aux_start_idx=232,   # = history_start_idx + (history_len - 1) * history_obs_dim
+        aux_obs_dim=58,
+        d_model=256,
+        n_heads=4,
+        encoder_num_layers=2,
+        encoder_dim_feedforward=512,
+        velocity_pred_dim=3,
+        enable_aux_loss=False,
+        detach_velocity_pred=True,
+    )
+
+    algorithm = RslRlVelocityEstimatorPpoAlgorithmCfg(
+        class_name="unitree_rl_lab.utils.velocity_estimator_ppo:VelocityEstimatorPPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,            # disable next-obs prediction
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,        # supervised SmoothL1 on v_hat
+        achieved_ang_vel_scale=0.2,   # legacy parent kw, unused by VelocityEstimatorPPO targets
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+    )
+
 
 
 # ---- Contrastive Latent Policy (CLP) ----
@@ -511,4 +595,163 @@ class G115DofContrastiveTransformerPPORunnerCfg(BasePPORunnerV3Cfg):
         gen_coef_end=0.2,
         tau_init=0.1,
         learnable_tau=False,
+    )
+
+
+# ---- V22a: V21g + frozen V3 segment encoder z_gait into actor ----
+@configclass
+class RslRlTransformerLatentGaitModelCfg(RslRlTransformerLatentModelCfg):
+    """Actor cfg for TransformerLatentGaitModel (extra gait_dim slot)."""
+
+    class_name: str = (
+        "unitree_rl_lab.utils.frozen_segment_encoder:TransformerLatentGaitModel"
+    )
+    gait_dim: int = 32
+
+
+@configclass
+class RslRlSegmentEncoderPpoAlgorithmCfg(RslRlVelocityEstimatorPpoAlgorithmCfg):
+    """Algorithm cfg for SegmentEncoderVelocityEstimatorPPO (V22a)."""
+
+    class_name: str = (
+        "unitree_rl_lab.utils.segment_encoder_ppo:SegmentEncoderVelocityEstimatorPPO"
+    )
+    encoder_path: str = (
+        "/root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt"
+    )
+    z_buffer_len: int = 32
+    gait_dim: int = 32
+    actor_obs_key: str = "policy"
+
+
+@configclass
+class G115DofV22aSegmentEncoderPPORunnerCfg(G115DofV21eVelocityEstimatorPPORunnerCfg):
+    """V22a: V21g env + V21e actor extended with frozen V3 z_gait."""
+
+    actor = RslRlTransformerLatentGaitModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        history_len=5,
+        history_start_idx=0,
+        history_obs_dim=58,
+        aux_start_idx=232,
+        aux_obs_dim=58,
+        d_model=256,
+        n_heads=4,
+        encoder_num_layers=2,
+        encoder_dim_feedforward=512,
+        velocity_pred_dim=3,
+        enable_aux_loss=False,
+        detach_velocity_pred=True,
+        gait_dim=32,
+    )
+
+    algorithm = RslRlSegmentEncoderPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+        encoder_path="/root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt",
+        z_buffer_len=32,
+        gait_dim=32,
+        actor_obs_key="policy",
+    )
+
+
+# ---- V21l: LIRPG (learnable intrinsic tracking reward) ----
+
+@configclass
+class G115DofV21lLirpgRunnerCfg(G115DofV21eVelocityEstimatorPPORunnerCfg):
+    """V21l: V21e runner with LIRPG PPO subclass.
+
+    The intrinsic reward MLPs live in the global registry of
+    `unitree_rl_lab.utils.intrinsic_reward` and are created lazily by the
+    `track_*_intrinsic` reward terms in the V21l env cfg. The LIRPG PPO
+    subclass adds a per-rollout meta-gradient step on each MLP.
+    """
+
+    def __post_init__(self):
+        super().__post_init__() if hasattr(super(), "__post_init__") else None
+        self.algorithm.class_name = (
+            "unitree_rl_lab.utils.lirpg_ppo:LirpgVelocityEstimatorPPO"
+        )
+
+
+
+class G115DofV21mLirpgRunnerCfg(G115DofV21lLirpgRunnerCfg):
+    """V21m: same LIRPG PPO runner as V21l; Gaussian sigma-kernel channels
+    are registered under 'lin_xy_gauss'/'ang_z_gauss' and have the same
+    meta_update / record_dones interface."""
+    pass
+
+# ---- V22b: V22a + metric-residual CIC intrinsic + SMERL gate ----
+@configclass
+class RslRlSegmentEncoderCICPpoAlgorithmCfg(RslRlSegmentEncoderPpoAlgorithmCfg):
+    """Algorithm cfg for SegmentEncoderCICPPO (V22b)."""
+
+    class_name: str = (
+        "unitree_rl_lab.utils.segment_encoder_cic_ppo:SegmentEncoderCICPPO"
+    )
+    cic_alpha_max: float = 0.02
+    cic_warmup_start_iter: int = 200
+    cic_warmup_end_iter: int = 2000
+    smerl_threshold: float = 0.045
+    smerl_kappa: float = 200.0
+    track_ema_decay: float = 0.99
+    cmd_norm_eps: float = 0.1
+    cmd_obs_indices: list[int] = [42, 43, 44]
+    intrinsic_log_every: int = 200
+
+
+@configclass
+class G115DofV22bSegmentEncoderCICPPORunnerCfg(G115DofV22aSegmentEncoderPPORunnerCfg):
+    """V22b: V22a + metric-residual intrinsic reward."""
+
+    algorithm = RslRlSegmentEncoderCICPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+        encoder_path="/root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt",
+        z_buffer_len=32,
+        gait_dim=32,
+        actor_obs_key="policy",
+        cic_alpha_max=0.02,
+        cic_warmup_start_iter=200,
+        cic_warmup_end_iter=2000,
+        smerl_threshold=0.045,
+        smerl_kappa=200.0,
+        track_ema_decay=0.99,
+        cmd_norm_eps=0.1,
+        cmd_obs_indices=[42, 43, 44],
+        intrinsic_log_every=200,
     )

@@ -22,6 +22,10 @@ public:
     }
     
     std::vector<float> action;
+    // Velocity prediction output [vx, vy, wz] from velocity_head.
+    // Non-empty only when the ONNX model exports a "velocity_pred" output
+    // (i.e. TransformerLatentModel policies; empty for plain MLP policies).
+    std::vector<float> velocity_pred;
 protected:
     std::mutex act_mtx_;
 };
@@ -52,13 +56,22 @@ public:
             input_sizes.push_back(size);
         }
 
-        // Get output shape
-        Ort::TypeInfo output_type = session->GetOutputTypeInfo(0);
-        output_shape = output_type.GetTensorTypeAndShapeInfo().GetShape();
-        auto output_name = session->GetOutputNameAllocated(0, allocator);
-        output_names.push_back(output_name.release());
+        // Load ALL output names and shapes (supports 1 or 2 outputs)
+        const size_t n_out = session->GetOutputCount();
+        for (size_t i = 0; i < n_out; ++i) {
+            Ort::TypeInfo ot = session->GetOutputTypeInfo(i);
+            output_shapes.push_back(ot.GetTensorTypeAndShapeInfo().GetShape());
+            auto oname = session->GetOutputNameAllocated(i, allocator);
+            output_names.push_back(oname.release());
+        }
 
-        action.resize(output_shape[1]);
+        // First output: actions
+        action.resize(output_shapes[0][1]);
+
+        // Second output (optional): velocity_pred [vx, vy, wz]
+        if (n_out >= 2) {
+            velocity_pred.resize(output_shapes[1][1], 0.0f);
+        }
     }
 
     std::vector<float> act(std::unordered_map<std::string, std::vector<float>> obs)
@@ -74,7 +87,7 @@ public:
 
         // Create input tensors
         std::vector<Ort::Value> input_tensors;
-        for(int i(0); i<input_names.size(); ++i)
+        for(int i(0); i<static_cast<int>(input_names.size()); ++i)
         {
             const std::string name_str(input_names[i]);
             auto& input_data = obs.at(name_str);
@@ -82,13 +95,23 @@ public:
             input_tensors.push_back(std::move(input_tensor));
         }
 
-        // Run the model
-        auto output_tensor = session->Run(Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(), input_tensors.size(), output_names.data(), 1);
+        // Run the model (request all registered outputs)
+        auto output_tensors = session->Run(Ort::RunOptions{nullptr},
+            input_names.data(), input_tensors.data(), input_tensors.size(),
+            output_names.data(), output_names.size());
 
-        // Copy output data
-        auto floatarr = output_tensor.front().GetTensorMutableData<float>();
         std::lock_guard<std::mutex> lock(act_mtx_);
-        std::memcpy(action.data(), floatarr, output_shape[1] * sizeof(float));
+
+        // Copy action output
+        auto floatarr = output_tensors[0].GetTensorMutableData<float>();
+        std::memcpy(action.data(), floatarr, output_shapes[0][1] * sizeof(float));
+
+        // Copy velocity_pred output if present
+        if (output_tensors.size() >= 2) {
+            auto vel_arr = output_tensors[1].GetTensorMutableData<float>();
+            std::memcpy(velocity_pred.data(), vel_arr, output_shapes[1][1] * sizeof(float));
+        }
+
         return action;
     }
 
@@ -103,6 +126,6 @@ private:
 
     std::vector<std::vector<int64_t>> input_shapes;
     std::vector<int64_t> input_sizes;
-    std::vector<int64_t> output_shape;
+    std::vector<std::vector<int64_t>> output_shapes;
 };
 };

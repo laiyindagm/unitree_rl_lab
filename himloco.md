@@ -21,3 +21,73 @@ $$
 以上是该项目在论文中对方法的描述
 这是这个项目通过对比学习优化将一条轨迹编码为隐变量。我想借鉴这个方法，我也想将历史观测编码为隐变量，但不同的是，我希望最大化相同速度桶中的轨迹的潜在特征的相似性，并使不同桶中的轨迹的潜在特征原理，并期望这样可以隐式建模出不同速度下的步态信息。
 我希望，你调研先进的对比学习方案给出编码器的设计和训练范式方案
+
+1.我目前给的cmd，已经是离散的了，所以分桶本身是自然的，但是我在实际实验时发现：训练前期，你给出速度，但是实际机器人行走速度远不及cmd；就算中后期，实际的速度距离cmd也有很大差距。如果以指令而不是该轨迹实际对应的速度为标签。会不会产生问题？
+
+2.为我介绍一下Causal Transformer，以及如何将其用于编码
+
+3.对 (v_x, v_y, ω_z) 各自分桶后做笛卡尔乘积。
+
+4.我有疑问，你说的“保留"同 trajectory 相邻帧"作为额外正样本”，单帧和多历史帧堆叠的不同形状的输入都是经过相同编码器编码么？him是怎么操作的？此外，我认为相同正样本应该具有相似的语义，这样扩充不好，或许可以考虑加一个学习目标，同时最大化历史观测与下一观测之间潜在特征的相似性并最大化相同速度桶中的轨迹的潜在特征的相似性？
+
+Representation loss（你之前已经设计的，照旧）： $$\mathcal{L}{\text{proto}} = -\log \frac{\exp(z{\text{mode},t}^\top e_{b_t}/\tau)}{\sum_{b'} \exp(z_{\text{mode},t}^\top e_{b'}/\tau)}$$
+
+内在奖励（关键的新东西）： $$\boxed{,r^{\text{int}}t = \underbrace{\log \frac{\exp(z{\text{mode},t}^\top e_{b_t}/\tau)}{\sum_{b'} \exp(z_{\text{mode},t}^\top e_{b'}/\tau)}}{=-\mathcal{L}{\text{proto}}\text{ 的样本值}} + \log K,}$$
+
+加 
+log
+⁡
+K
+ 是为了把内在 reward 居中到 0 附近（均匀分配下 reward=0）。注意这个 reward 是 detach 掉 encoder 梯度 的——它纯粹用作标量 reward 喂给 PPO；而 encoder 仍然由 
+L
+proto
+ 通过普通监督学习更新。
+
+SMERL 门控： 
+
+
+$$\mathrm{gate}t = \sigma!\left(\kappa \cdot (\bar r^{\text{track}}{[t-T:t]} - \beta)\right)$$
+
+用 sigmoid 而非 hard 阈值，避免 reward 阶跃。
+β
+ 取你跟踪 reward 在"勉强能跟上"水平的值；
+α
+ 从小到大 schedule（例如 0 → 0.1）。
+
+ $$
+ v_{cmd} = 0, r = 1 - \frac{|v|}{b} 
+ $$
+
+ $$
+ v_{cmd} > 0, r = 1 - \frac{|v - v_{cmd}|}{v_{cmd}}
+ $$
+
+ $$
+ 其中，b满足，对v>0，1 - \frac{|v|}{b}  \leq \exp(-\frac{v^2}{\sigma})
+ $$
+
+ 在基于 PPO 的四足/双足机器人速度追踪任务中，标准做法是用高斯核作为追踪奖励：
+
+记$e=|v-v_{cmd}|$
+ $$
+ r=exp(-\frac{e^2}{\sigma^2})
+ $$
+ 实验发现（和猜想）
+通过控制变量的 5 路对照实验（V21f2/g/h/i/j），发现：
+1. 高斯核等价于"恒定斜率线性 + 饱和边界"：在误差∣e∣<σ 附近，
+
+Derivation: solve for b such that exp(-x^2/std^2) >= 1 - x/b for all x>=0.
+Tangency condition (2v+1)*exp(-v) = 1 with v = (x/std)^2 gives v* ~= 1.25643,
+so b = std * exp(v*) / (2*sqrt(v*)) ~= 1.5670 * std. 
+2. 相对线性核 r=1−∣e∣/max(∣vcmd∣,b) 在低速指令区间（∣vcmd∣<0.7,优于高斯核——猜测原因是分母更小，等效梯度更陡。
+3. 高斯核在高速线性追踪优于相对线性——因相对线性分母=∣vcmd∣ 导致梯度被稀释
+4. 猜测核形状改进的真实机制是消除梯度死区而非核函数的几何形状。
+
+核心猜想
+追踪奖励的有效信息只有两条：(1) 梯度幅度（斜率）；(2) 误差大时是否保持非零梯度防止早期终止。
+即存在某个状态/指令依赖的最优斜率函数 $f(v,e)$
+使追踪奖励形式为：
+$$
+r = leaky(1-f(v,e)*e)
+$$
+除了桶级参数化（离线 grid/Bayes 搜索）：将 (mode × speed_bucket) 的 $\sim$9 个斜率参数视为超参，短训枚举以外，是否存在将f建模为mlp，通过在线元强化学习的方案更新的思路？给出推导

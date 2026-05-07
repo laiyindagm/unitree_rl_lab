@@ -1072,3 +1072,201 @@ gym.register(
         "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21dTransformerLatentPPORunnerCfg",
     },
 )
+
+# V21e: V21c env (unchanged) + actor-side detached velocity estimator MLP with
+# corrected supervised aux loss. Three V21d defects fixed: algorithm class is
+# now VelocityEstimatorPPO (not UnitreePPO), achieved-velocity targets are
+# extracted from the correct term-major slice of the critic flat-obs, and
+# history_obs_dim auto-computes (=58) instead of the erroneous 54.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21e",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21e:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21e:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21f: V21e (env + actor velocity estimator) + linear decay (iter 6000->12000)
+# of the three gait-shaping rewards (gait, feet_clearance, rotation_single_support).
+# Decay window chosen from V21e log: walking firmly established by iter ~6000
+# (bad_orient<5%, ep_len>950, both track rewards>0.5). Reuses the V21e runner.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21f",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21f:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21f:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21f2: corrected V21f. V21f used iter-valued start_step/end_step for the
+# *_decayed gait shaping rewards, but _linear_step_decay reads
+# env.common_step_counter (env steps = iter * num_steps_per_env). The intended
+# iter window 6000->12000 collapsed to step 6000->12000 (= iter 250..500),
+# so V21f effectively trained without gait shaping. V21f2 multiplies by
+# num_steps_per_env (=24): start=144000 (iter 6000), end=288000 (iter 12000).
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21f2",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21f2:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21f2:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21g: V21f2 (best 19999-iter baseline) + linear relative-error tracking
+# applied to the entire velocity space. Replaces the exp(-||err||^2/std^2)
+# kernel of the two tracking rewards (track_lin_vel_xy, track_ang_vel_z) with
+# r = clamp(1 - |err|/max(|cmd|, 1.5670*std), 0, 1). At |cmd|=0 this reduces
+# to 1 - |x|/(1.5670*std), with the constant 1.5670 derived as the unique
+# tangency multiplier so that the linear form is provably <= the exp form
+# (no extra "free reward" introduced). Decayed gait shaping kept unchanged.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21g",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21g:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21g:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21h: V21f2 hybrid with rel_floor 0.05 -> 0.5 (single-variable dead-zone fix).
+# Same kernel SHAPE as V21f2 (hybrid exp + linear-relative); only the divisor
+# floor in the r_rel branch is raised so that for yaw cmd in [-0.8, 0.8] the
+# previously dead region (err > |cmd| -> r=0, grad=0) is converted into a
+# linearly-decreasing reward with constant negative slope. Isolates "kill
+# dead zone" from V21g's "change kernel form".
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21h",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21h:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21h:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21i: STRICT piecewise tracking matching the literal user spec.
+#   cmd = 0 :  r = 1 - |v|/b     (b = 1.5670*std)
+#   cmd > 0 :  r = 1 - |v-cmd|/|cmd|     (NO max with b -> dead zones for cmd>0)
+# Differs from V21g (`*_relative_full`) which used max(|cmd|, b); V21i uses
+# a hard switch at |cmd|<1e-3.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21i",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21i:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21i:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21j: V21i strict piecewise + LEAKY negative tail (slope_neg=0.1).
+# Same denominator structure as V21i (cmd=0 -> b; cmd>0 -> |cmd|, no max).
+# But replace clamp(0,1) with leaky: r = raw if raw>=0 else 0.1*raw, capped <=1.
+# Eliminates V21i's dead zone WITHOUT introducing the b-soft-floor of V21g.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21j",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21j:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21j:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21k: constant-denominator leaky linear (NO per-cmd scaling, NO piecewise).
+# r = 1 - |v - v_cmd| / b_abs       if raw >= 0
+# r = 0.1 * raw                     if raw <  0   (capped at <=1)
+# b_abs = LINEAR_REL_B_RATIO * std = 0.7834. Tests user hypothesis that exp
+# kernel is asymptotically equivalent to fixed-slope linear + leaky tail.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21k",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21k:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21k:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21eVelocityEstimatorPPORunnerCfg",
+    },
+)
+
+
+# V21l: LIRPG (learnable intrinsic tracking reward).
+# Per-channel MLP r_phi(v, v_cmd) initialized to V21k baseline and
+# meta-updated online to maximize task return = -|v - v_cmd|.
+# Uses LirpgVelocityEstimatorPPO subclass (V21e runner + meta hook).
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21l",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21l:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21l:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21lLirpgRunnerCfg",
+    },
+)
+
+# V21m: Gaussian LIRPG - r = exp(-e^2 / sigma(v_cmd)^2) with learnable sigma.
+# Same 1.5:1.5 lin:ang weights as V21l, same LIRPG PPO runner.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21m",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21m:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21m:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21mLirpgRunnerCfg",
+    },
+)
+
+# V22a: V21g env + frozen V3 segment-encoder z_gait injected into the actor's
+# policy latent. The encoder is loaded from
+# /root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt, kept in
+# eval/no_grad, and fed by a per-env rolling buffer of the 295-dim flat policy
+# obs (T_seg=32). Critic is unchanged — z_gait is policy-side only.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V22a",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v22a:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v22a:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV22aSegmentEncoderPPORunnerCfg",
+    },
+)
+
+
+# V22b: V22a + metric-residual intrinsic reward + SMERL gate.
+# r_intrinsic = ||z - z_axial(v_cmd)||^2 / d_gait, axial bases from V3 ckpt.
+# Encoder still frozen; reward only takes effect after iter warmup and once
+# SMERL gate (per-env env-reward EMA above threshold) opens.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V22b",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v22b:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v22b:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV22bSegmentEncoderCICPPORunnerCfg",
+    },
+)

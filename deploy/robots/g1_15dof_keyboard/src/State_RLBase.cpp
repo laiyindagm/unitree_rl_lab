@@ -195,4 +195,29 @@ void State_RLBase::run()
     for (int i = 0; i < static_cast<int>(action_motor_ids_.size()); i++) {
         lowcmd->msg_.motor_cmd()[action_motor_ids_[i]].q() = action[i];
     }
+
+    // Print commanded velocity, real base angular velocity (from IMU), and
+    // v_hat predicted by velocity_head (inside ONNX) every ~500 ms.
+    // run() is called at 1 kHz, so we print once every 500 calls.
+    if (++print_counter_ % 500 == 0) {
+        const auto& ang  = env->robot->data.root_ang_vel_b;
+        const auto& vhat = env->alg->velocity_pred;
+        const auto  cmd  = g_keyboard_teleop.command();
+        if (!vhat.empty()) {
+            spdlog::info(
+                "[vel] cmd=[{:.2f},{:.2f},{:.2f}]  "
+                "real_wz={:.3f}  "
+                "v_hat=[{:.3f},{:.3f},{:.3f}]",
+                cmd[0], cmd[1], cmd[2],
+                ang[2],
+                vhat[0], vhat[1], vhat[2]
+            );
+        } else {
+            spdlog::info(
+                "[vel] cmd=[{:.2f},{:.2f},{:.2f}]  real_wz={:.3f}",
+                cmd[0], cmd[1], cmd[2],
+                ang[2]
+            );
+        }
+    }
 }

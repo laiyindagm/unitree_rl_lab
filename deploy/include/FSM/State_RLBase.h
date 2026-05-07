@@ -67,6 +67,7 @@ protected:
 private:
     std::thread policy_thread;
     bool policy_thread_running = false;
+    uint64_t print_counter_ = 0;
 };
 
 REGISTER_FSM(State_RLBase)
