@@ -72,7 +72,21 @@ case "$1" in
         ;;
     -p|--play)
         shift
-        ${python_exe} ${UNITREE_RL_LAB_PATH}/scripts/rsl_rl/play.py "$@"
+        if [[ "$1" == *.py ]]; then
+            script_path="$1"
+            if [[ -f "${UNITREE_RL_LAB_PATH}/${script_path}" ]]; then
+                script_path="${UNITREE_RL_LAB_PATH}/${script_path}"
+            fi
+            if [[ -f "${script_path}" ]]; then
+                shift
+                ${python_exe} "${script_path}" "$@"
+            else
+                echo "[Error] Python script not found: $1"
+                exit 1
+            fi
+        else
+            ${python_exe} ${UNITREE_RL_LAB_PATH}/scripts/rsl_rl/play.py "$@"
+        fi
         ;;
     -t|--train)
         shift

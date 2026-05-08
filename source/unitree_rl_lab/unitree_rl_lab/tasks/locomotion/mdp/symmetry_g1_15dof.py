@@ -6,11 +6,12 @@ Observation layout (per frame, history_length=5, flatten_history_dim=True):
   velocity_commands            : 3 dims  × 5 = 15
   [lin_speed_reward_regime_token] : 2 dims  × 5 = 10  (optional)
   [gait_mode_token_3]          : 3 dims  × 5 = 15  (optional)
+  [gait_mode_token]            : 5 dims  × 5 = 25  (optional)
   joint_pos_rel                : 15 dims × 5 = 75
   joint_vel_rel                : 15 dims × 5 = 75
   last_action                  : 15 dims × 5 = 75
   [gait_phase]                 : 2 dims  × 5 = 10  (optional)
-  Total: 270 / 285 / 295 / 305 depending on optional tokens
+  Total: 270 / 285 / 295 / 305 / 315 depending on optional tokens
 
 Joint order (TRAIN_JOINT_NAMES resolved from URDF):
   0: left_hip_pitch     6: right_hip_pitch    12: waist_yaw
@@ -109,6 +110,7 @@ def _mirror_policy_obs(env: ManagerBasedRLEnv, obs: torch.Tensor) -> torch.Tenso
     active_terms = env.observation_manager.active_terms["policy"]
     has_lin_speed_reward_regime_token = "lin_speed_reward_regime_token" in active_terms
     has_gait_mode_token_3 = "gait_mode_token_3" in active_terms
+    has_gait_mode_token = "gait_mode_token" in active_terms
     has_gait_phase = "gait_phase" in active_terms
 
     idx = 0
@@ -134,6 +136,10 @@ def _mirror_policy_obs(env: ManagerBasedRLEnv, obs: torch.Tensor) -> torch.Tenso
     # gait_mode_token_3  (3 × H) — reflection-invariant
     if has_gait_mode_token_3:
         idx += 3 * H
+
+    # gait_mode_token  (5 × H) — reflection-invariant
+    if has_gait_mode_token:
+        idx += 5 * H
 
     # joint_pos_rel  (15 × H)
     obs[:, idx:idx + 15 * H] = _mirror_block(

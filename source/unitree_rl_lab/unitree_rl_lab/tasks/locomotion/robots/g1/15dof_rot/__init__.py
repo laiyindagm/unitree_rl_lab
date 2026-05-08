@@ -1239,6 +1239,20 @@ gym.register(
     },
 )
 
+# V21n: V21f2 + 5-mode command token
+# {standing, pure_vx, pure_vy, pure_wz, joint(>=2 axes)} and yaw tracking
+# coefficient reduced to 2.0.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21n",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21n:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21n:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21nFiveModeVelocityEstimatorPPORunnerCfg",
+    },
+)
+
 # V22a: V21g env + frozen V3 segment-encoder z_gait injected into the actor's
 # policy latent. The encoder is loaded from
 # /root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt, kept in

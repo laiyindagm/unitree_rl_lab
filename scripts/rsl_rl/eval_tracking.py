@@ -14,8 +14,8 @@ WHY NOT USE EXISTING PROBES:
                   low-speed errors capped by accuracy_cmd_min
 
 THIS SCRIPT: fixed command throughout, warmup excluded, per-env cumulative
-alive mask (fallen envs excluded after first termination), relative error
-per bin, multi-checkpoint comparison on the same env.
+alive mask (fallen envs excluded after first termination), trajectory-mean
+velocity error per bin, multi-checkpoint comparison on the same env.
 
 USAGE:
     ./unitree_rl_lab.sh -p scripts/rsl_rl/eval_tracking.py \\
@@ -55,6 +55,8 @@ parser.add_argument("--no_vy", action="store_true", default=False,
                     help="Skip pure-vy sweep.")
 parser.add_argument("--output_csv", type=str, default=None,
                     help="Optional path to write CSV results.")
+parser.add_argument("--eval_seed", type=int, default=12345,
+                    help="Seed reset before every sweep. Same sweep/checkpoint gets same initial conditions.")
 parser.add_argument("--disable_fabric", action="store_true", default=False)
 parser.add_argument("--zero_vhat_labels", type=str, nargs="*", default=None,
                     help="Labels whose checkpoints should have v_hat zeroed during eval. "
@@ -74,6 +76,7 @@ import os
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -182,15 +185,50 @@ def _patch_zero_vhat(policy):
 # ---- Sim helpers ------------------------------------------------------------
 
 def _force_commands(env_unwrapped, cmds):
-    """Set vel_command_b per env and prevent resampling.
+    """Set vel_command_b per env, prevent resampling, and align mode flags.
 
     Args:
         cmds: (N, 3) tensor [vx, vy, wz] per env.
     """
     cmd_term = env_unwrapped.command_manager._terms["base_velocity"]
+    if cmds.shape != cmd_term.vel_command_b.shape:
+        raise ValueError(
+            f"Command tensor shape {tuple(cmds.shape)} does not match "
+            f"base_velocity shape {tuple(cmd_term.vel_command_b.shape)}"
+        )
+
+    eps = 1e-6
+    vx_zero = cmds[:, 0].abs() <= eps
+    vy_zero = cmds[:, 1].abs() <= eps
+    wz_zero = cmds[:, 2].abs() <= eps
+    standing = vx_zero & vy_zero & wz_zero
+    pure_vx = (~vx_zero) & vy_zero & wz_zero
+    pure_vy = vx_zero & (~vy_zero) & wz_zero
+    pure_wz = vx_zero & vy_zero & (~wz_zero)
+
     cmd_term.vel_command_b[:] = cmds
     # time_left <= 0 triggers resample; set large to prevent it.
     cmd_term.time_left.fill_(1e6)
+
+    # Keep command post-processing from undoing the forced sweep command.
+    if hasattr(cmd_term, "is_heading_env"):
+        cmd_term.is_heading_env[:] = False
+    if hasattr(cmd_term, "is_standing_env"):
+        cmd_term.is_standing_env[:] = standing
+    if hasattr(cmd_term, "is_rotating_env"):
+        cmd_term.is_rotating_env[:] = pure_wz
+    if hasattr(cmd_term, "is_pure_vx_env"):
+        cmd_term.is_pure_vx_env[:] = pure_vx
+    if hasattr(cmd_term, "is_pure_vy_env"):
+        cmd_term.is_pure_vy_env[:] = pure_vy
+    if hasattr(cmd_term, "is_linear_env"):
+        cmd_term.is_linear_env[:] = False
+    if hasattr(cmd_term, "is_zero_vel_x_env"):
+        cmd_term.is_zero_vel_x_env[:] = vx_zero
+    if hasattr(cmd_term, "is_zero_vel_y_env"):
+        cmd_term.is_zero_vel_y_env[:] = vy_zero
+    if hasattr(cmd_term, "is_zero_vel_yaw_env"):
+        cmd_term.is_zero_vel_yaw_env[:] = wz_zero
 
 
 def _actual_velocities(env_unwrapped):
@@ -209,9 +247,29 @@ def _actual_velocities(env_unwrapped):
     return lin_vel, ang_vel
 
 
+def _compute_observations(env, update_history=False):
+    """Compute observations with optional history update, matching RslRlVecEnvWrapper."""
+    if hasattr(env.unwrapped, "observation_manager"):
+        obs_dict = env.unwrapped.observation_manager.compute(update_history=update_history)
+    else:
+        obs_dict = env.unwrapped._get_observations()
+    return TensorDict(obs_dict, batch_size=[env.num_envs])
+
+
+def _reset_with_forced_commands(env, cmd_tensor, seed):
+    """Reset env, install fixed commands, and rebuild obs history from those commands."""
+    if seed is not None:
+        env.seed(seed)
+    env.reset()
+    _force_commands(env.unwrapped, cmd_tensor)
+    if hasattr(env.unwrapped, "observation_manager"):
+        env.unwrapped.observation_manager.reset()
+    return _compute_observations(env, update_history=True)
+
+
 # ---- Per-sweep evaluation ---------------------------------------------------
 
-def run_sweep(env, policy, sweep_cmds, envs_per_bin, warmup_steps, measure_steps):
+def run_sweep(env, policy, sweep_cmds, envs_per_bin, warmup_steps, measure_steps, seed=None):
     """Evaluate one sweep in parallel (all bins simultaneously).
 
     Args:
@@ -219,8 +277,9 @@ def run_sweep(env, policy, sweep_cmds, envs_per_bin, warmup_steps, measure_steps
                     The env must have been created with len(sweep_cmds)*envs_per_bin envs.
 
     Returns dict with per-bin numpy arrays:
-        abs_err_lin, std_err_lin, rel_err_lin  -- linear tracking [m/s]
-        abs_err_ang, std_err_ang, rel_err_ang  -- angular tracking [rad/s]
+        abs_err_lin, std_err_lin, rel_err_lin  -- trajectory-mean linear tracking [m/s]
+        abs_err_ang, std_err_ang, rel_err_ang  -- trajectory-mean angular tracking [rad/s]
+        inst_abs_err_*                         -- mean step-wise error, diagnostic only
         fall_rate                              -- fraction of envs that fell
         total_steps                            -- sum of alive steps per bin
     """
@@ -236,85 +295,136 @@ def run_sweep(env, policy, sweep_cmds, envs_per_bin, warmup_steps, measure_steps
         cmd_tensor[lo:hi, 1] = vy
         cmd_tensor[lo:hi, 2] = wz
 
-    # Reset and force command.
-    # RslRlVecEnvWrapper.get_observations() returns TensorDict (not a tuple)
-    obs = env.get_observations()
-    _force_commands(env.unwrapped, cmd_tensor)
+    # Reset and force command. Observation history is rebuilt after forcing,
+    # otherwise policy history can contain the random command sampled at reset.
+    obs = _reset_with_forced_commands(env, cmd_tensor, seed=seed)
+
+    alive      = torch.ones(total_envs, dtype=torch.bool, device=device)
+    fallen     = torch.zeros(total_envs, dtype=torch.bool, device=device)
 
     # Warmup: let robot reach steady state.
     for _ in range(warmup_steps):
         with torch.inference_mode():
             actions = policy(obs)
-        obs, _, _, _ = env.step(actions)
+        obs, _, dones, _ = env.step(actions)
+        done_bool = dones.bool()
+        fallen |= done_bool
+        alive &= ~done_bool
         _force_commands(env.unwrapped, cmd_tensor)
 
     # Measurement accumulators per env.
-    alive      = torch.ones(total_envs, dtype=torch.bool, device=device)
-    fallen     = torch.zeros(total_envs, dtype=torch.bool, device=device)
-    err_lin_sum  = torch.zeros(total_envs, device=device)
-    err_lin_sum2 = torch.zeros(total_envs, device=device)
-    err_ang_sum  = torch.zeros(total_envs, device=device)
-    err_ang_sum2 = torch.zeros(total_envs, device=device)
-    step_counts  = torch.zeros(total_envs, device=device)
-    vel_lin_sum  = torch.zeros(total_envs, 2, device=device)  # actual [vx, vy]
-    vel_ang_sum  = torch.zeros(total_envs, device=device)     # actual wz
+    inst_err_lin_sum  = torch.zeros(total_envs, device=device)
+    inst_err_lin_sum2 = torch.zeros(total_envs, device=device)
+    inst_err_ang_sum  = torch.zeros(total_envs, device=device)
+    inst_err_ang_sum2 = torch.zeros(total_envs, device=device)
+    step_counts       = torch.zeros(total_envs, device=device)
+    vel_lin_sum       = torch.zeros(total_envs, 2, device=device)  # actual [vx, vy]
+    vel_ang_sum       = torch.zeros(total_envs, device=device)     # actual wz
 
     for _ in range(measure_steps):
         with torch.inference_mode():
             actions = policy(obs)
         obs, _, dones, _ = env.step(actions)
         _force_commands(env.unwrapped, cmd_tensor)
+        done_bool = dones.bool()
 
         lin_vel, ang_vel = _actual_velocities(env.unwrapped)
         err_lin = (lin_vel - cmd_tensor[:, :2]).norm(dim=-1)   # (N,)
         err_ang = (ang_vel - cmd_tensor[:, 2]).abs()            # (N,)
 
-        # Accumulate only while the env is alive (cumulative alive mask).
-        mask = alive.float()
-        err_lin_sum  += err_lin * mask
-        err_lin_sum2 += (err_lin ** 2) * mask
-        err_ang_sum  += err_ang * mask
-        err_ang_sum2 += (err_ang ** 2) * mask
-        step_counts  += mask
-        vel_lin_sum  += lin_vel * mask.unsqueeze(-1)   # actual lin vel
-        vel_ang_sum  += ang_vel * mask                 # actual ang vel
+        # Exclude envs that terminated on this step. IsaacLab has already reset
+        # them before we read velocities, so their current root velocity is no
+        # longer part of the failed trajectory.
+        step_mask = alive & ~done_bool
+        mask = step_mask.float()
+        inst_err_lin_sum  += err_lin * mask
+        inst_err_lin_sum2 += (err_lin ** 2) * mask
+        inst_err_ang_sum  += err_ang * mask
+        inst_err_ang_sum2 += (err_ang ** 2) * mask
+        step_counts       += mask
+        vel_lin_sum       += lin_vel * mask.unsqueeze(-1)
+        vel_ang_sum       += ang_vel * mask
 
         # Once an env terminates, exclude it from all future steps.
-        fallen |= dones.bool()
-        alive  &= ~dones.bool()
+        fallen |= done_bool
+        alive  &= ~done_bool
 
     # Aggregate per bin (reshape to [n_bins, envs_per_bin]).
     def rb(t):
         return t.view(n_bins, envs_per_bin)
 
-    step_counts_r  = rb(step_counts)
-    err_lin_sum_r  = rb(err_lin_sum)
-    err_lin_sum2_r = rb(err_lin_sum2)
-    err_ang_sum_r  = rb(err_ang_sum)
-    err_ang_sum2_r = rb(err_ang_sum2)
-    fallen_r       = rb(fallen.float())
+    step_counts_r      = rb(step_counts)
+    inst_err_lin_sum_r = rb(inst_err_lin_sum)
+    inst_err_lin_sum2_r = rb(inst_err_lin_sum2)
+    inst_err_ang_sum_r = rb(inst_err_ang_sum)
+    inst_err_ang_sum2_r = rb(inst_err_ang_sum2)
+    fallen_r           = rb(fallen.float())
 
     total_steps = step_counts_r.sum(dim=1)        # (n_bins,)
     safe_total  = total_steps.clamp(min=1.0)
 
-    mean_lin = (err_lin_sum_r.sum(dim=1)  / safe_total).cpu().numpy()
-    mean_ang = (err_ang_sum_r.sum(dim=1)  / safe_total).cpu().numpy()
+    # Diagnostic only: mean of instantaneous |v_t - cmd|.
+    inst_mean_lin_t = inst_err_lin_sum_r.sum(dim=1) / safe_total
+    inst_mean_ang_t = inst_err_ang_sum_r.sum(dim=1) / safe_total
 
     # Variance via E[x^2] - (E[x])^2.
-    mean_lin_t = torch.tensor(mean_lin, device=device)
-    mean_ang_t = torch.tensor(mean_ang, device=device)
-    var_lin = ((err_lin_sum2_r.sum(dim=1) / safe_total) - mean_lin_t ** 2).clamp(min=0)
-    var_ang = ((err_ang_sum2_r.sum(dim=1) / safe_total) - mean_ang_t ** 2).clamp(min=0)
-    std_lin = var_lin.sqrt().cpu().numpy()
-    std_ang = var_ang.sqrt().cpu().numpy()
+    inst_var_lin = (
+        (inst_err_lin_sum2_r.sum(dim=1) / safe_total) - inst_mean_lin_t ** 2
+    ).clamp(min=0)
+    inst_var_ang = (
+        (inst_err_ang_sum2_r.sum(dim=1) / safe_total) - inst_mean_ang_t ** 2
+    ).clamp(min=0)
 
     fall_rate = (fallen_r.sum(dim=1) / envs_per_bin).cpu().numpy()
 
-    vel_lin_sum_r = vel_lin_sum.view(n_bins, envs_per_bin, 2)
-    vel_ang_sum_r = vel_ang_sum.view(n_bins, envs_per_bin)
-    mean_actual_vx = (vel_lin_sum_r[:, :, 0].sum(dim=1) / safe_total).cpu().numpy()
-    mean_actual_vy = (vel_lin_sum_r[:, :, 1].sum(dim=1) / safe_total).cpu().numpy()
-    mean_actual_wz = (vel_ang_sum_r.sum(dim=1)           / safe_total).cpu().numpy()
+    # Primary metric: first average actual velocity within each trajectory,
+    # then compare that trajectory-mean velocity to the command. This avoids
+    # counting normal gait-cycle velocity oscillation as tracking bias.
+    per_env_steps = step_counts.clamp(min=1.0)
+    mean_lin_env = vel_lin_sum / per_env_steps.unsqueeze(-1)
+    mean_ang_env = vel_ang_sum / per_env_steps
+    traj_err_lin = (mean_lin_env - cmd_tensor[:, :2]).norm(dim=-1)
+    traj_err_ang = (mean_ang_env - cmd_tensor[:, 2]).abs()
+    valid_env = (~fallen) & (step_counts > 0)
+
+    valid_r = rb(valid_env.float())
+    valid_counts = valid_r.sum(dim=1)
+    safe_valid = valid_counts.clamp(min=1.0)
+
+    traj_err_lin_r = rb(traj_err_lin * valid_env.float())
+    traj_err_ang_r = rb(traj_err_ang * valid_env.float())
+    mean_lin_t = traj_err_lin_r.sum(dim=1) / safe_valid
+    mean_ang_t = traj_err_ang_r.sum(dim=1) / safe_valid
+    var_lin = (
+        rb((traj_err_lin ** 2) * valid_env.float()).sum(dim=1) / safe_valid
+        - mean_lin_t ** 2
+    ).clamp(min=0)
+    var_ang = (
+        rb((traj_err_ang ** 2) * valid_env.float()).sum(dim=1) / safe_valid
+        - mean_ang_t ** 2
+    ).clamp(min=0)
+
+    mean_lin = mean_lin_t.cpu().numpy()
+    mean_ang = mean_ang_t.cpu().numpy()
+    std_lin = var_lin.sqrt().cpu().numpy()
+    std_ang = var_ang.sqrt().cpu().numpy()
+
+    mean_lin_env_r = mean_lin_env.view(n_bins, envs_per_bin, 2)
+    mean_ang_env_r = mean_ang_env.view(n_bins, envs_per_bin)
+    mean_actual_vx = (
+        (mean_lin_env_r[:, :, 0] * valid_r).sum(dim=1) / safe_valid
+    ).cpu().numpy()
+    mean_actual_vy = (
+        (mean_lin_env_r[:, :, 1] * valid_r).sum(dim=1) / safe_valid
+    ).cpu().numpy()
+    mean_actual_wz = (
+        (mean_ang_env_r * valid_r).sum(dim=1) / safe_valid
+    ).cpu().numpy()
+
+    valid_counts_np = valid_counts.cpu().numpy()
+    no_valid = valid_counts_np <= 0
+    for arr in (mean_lin, mean_ang, std_lin, std_ang, mean_actual_vx, mean_actual_vy, mean_actual_wz):
+        arr[no_valid] = np.nan
 
     # Relative errors (nan where command magnitude is zero).
     cmd_lin_mag = np.array([(vx**2 + vy**2)**0.5 for vx, vy, _ in sweep_cmds])
@@ -331,9 +441,14 @@ def run_sweep(env, policy, sweep_cmds, envs_per_bin, warmup_steps, measure_steps
         "rel_err_ang": rel_ang,
         "fall_rate":   fall_rate,
         "total_steps": total_steps.cpu().numpy(),
+        "valid_traj_count": valid_counts_np,
         "mean_actual_vx": mean_actual_vx,
         "mean_actual_vy": mean_actual_vy,
         "mean_actual_wz": mean_actual_wz,
+        "inst_abs_err_lin": inst_mean_lin_t.cpu().numpy(),
+        "inst_std_err_lin": inst_var_lin.sqrt().cpu().numpy(),
+        "inst_abs_err_ang": inst_mean_ang_t.cpu().numpy(),
+        "inst_std_err_ang": inst_var_ang.sqrt().cpu().numpy(),
     }
 
 
@@ -351,7 +466,7 @@ def _fp(v):
 
 def print_sweep_table(sweep_name, axis_label, bins, all_results):
     labels = [lbl for lbl, _ in all_results]
-    cols = ["abs_lin", "+-std", "rel_lin%", "abs_ang", "+-std", "rel_ang%", "fall%"]
+    cols = ["traj_lin", "+-std", "rel_lin%", "traj_ang", "+-std", "rel_ang%", "fall%"]
     cw = 8
 
     print(f"\n{'='*90}")
@@ -393,8 +508,10 @@ def print_sweep_table(sweep_name, axis_label, bins, all_results):
 def write_csv(sweeps_data, all_labels, path):
     suffixes = ["abs_err_lin", "std_err_lin", "rel_err_lin",
                 "abs_err_ang", "std_err_ang", "rel_err_ang",
-                "fall_rate", "total_steps",
-                "mean_actual_vx", "mean_actual_vy", "mean_actual_wz"]
+                "fall_rate", "total_steps", "valid_traj_count",
+                "mean_actual_vx", "mean_actual_vy", "mean_actual_wz",
+                "inst_abs_err_lin", "inst_std_err_lin",
+                "inst_abs_err_ang", "inst_std_err_ang"]
     fields = ["sweep", "axis_label", "bin_value"] + [
         f"{lbl}/{s}" for lbl in all_labels for s in suffixes
     ]
@@ -437,6 +554,8 @@ def main():
           f"({args_cli.warmup_steps * 0.02:.1f} s)")
     print(f"[eval_tracking] Measure       : {args_cli.measure_steps} steps "
           f"({args_cli.measure_steps * 0.02:.1f} s)")
+    print(f"[eval_tracking] Eval seed     : {args_cli.eval_seed}")
+    print("[eval_tracking] Primary error : |mean_t(actual_velocity) - command| per survived trajectory")
     print(f"[eval_tracking] Checkpoints ({len(args_cli.checkpoints)}):")
     for lbl, ckpt in zip(labels, args_cli.checkpoints):
         print(f"   {lbl:<26s}  {ckpt}")
@@ -486,6 +605,7 @@ def main():
                 envs_per_bin=args_cli.envs_per_bin,
                 warmup_steps=args_cli.warmup_steps,
                 measure_steps=args_cli.measure_steps,
+                seed=args_cli.eval_seed + sweep_idx,
             )
             # Trim padding bins.
             trimmed = {k: v[:n_bins] for k, v in res.items()}

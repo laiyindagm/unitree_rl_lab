@@ -459,6 +459,55 @@ class G115DofV21eVelocityEstimatorPPORunnerCfg(BasePPORunnerV3Cfg):
     )
 
 
+@configclass
+class G115DofV21nFiveModeVelocityEstimatorPPORunnerCfg(BasePPORunnerV3Cfg):
+    """V21n: V21f2-derived 5-mode token env with matching policy obs slices."""
+
+    actor = RslRlTransformerLatentModelCfg(
+        hidden_dims=[512, 256, 128],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=1.0, std_type="log"),
+        history_len=5,
+        history_start_idx=0,
+        # V21n policy obs single-frame dim =
+        # 3+3+3+2+5+15+15+15 = 61, flat history dim = 305.
+        history_obs_dim=61,
+        aux_start_idx=244,   # = history_start_idx + (history_len - 1) * history_obs_dim
+        aux_obs_dim=61,
+        d_model=256,
+        n_heads=4,
+        encoder_num_layers=2,
+        encoder_dim_feedforward=512,
+        velocity_pred_dim=3,
+        enable_aux_loss=False,
+        detach_velocity_pred=True,
+    )
+
+    algorithm = RslRlVelocityEstimatorPpoAlgorithmCfg(
+        class_name="unitree_rl_lab.utils.velocity_estimator_ppo:VelocityEstimatorPPO",
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        # Critic starts with base_lin_vel(3), base_ang_vel(3, scale=0.2).
+        # Later token-size changes do not move these term-major last-frame indices.
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+    )
+
+
 
 # ---- Contrastive Latent Policy (CLP) ----
 
