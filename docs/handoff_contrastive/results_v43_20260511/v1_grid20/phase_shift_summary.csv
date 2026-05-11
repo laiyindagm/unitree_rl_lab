@@ -1,0 +1,9 @@
+name,preset,seed,probe_json,R2_phase_from_Z,R2_phase_mlp_from_Z,phase_shift_ratio,phase_shift_same_parent_dist,phase_shift_same_bucket_dist,phase_shift_n_parent_groups
+G1_stats_rank015,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G1_stats_rank015/probe.json,0.07612679898738861,,,,,
+G2_stats_adv015,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G2_stats_adv015/probe.json,0.06547175347805023,,,,,
+G3_stats_alt3,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G3_stats_alt3/probe.json,0.07097204774618149,,,,,
+G4_stats_kin_metric,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G4_stats_kin_metric/probe.json,0.09135271608829498,,,,,
+G5_stats_no_action_metric,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G5_stats_no_action_metric/probe.json,0.09134566783905029,,,,,
+G6_stats_phiK3_dec256,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G6_stats_phiK3_dec256/probe.json,0.0723588690161705,,,,,
+G7_stats_yphi025,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G7_stats_yphi025/probe.json,0.07074064761400223,,,,,
+G8_stats_dual_aux16,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/grid20_v1/G8_stats_dual_aux16/probe.json,0.07390438765287399,,,,,

@@ -748,6 +748,181 @@ class G115DofV21mLirpgRunnerCfg(G115DofV21lLirpgRunnerCfg):
     meta_update / record_dones interface."""
     pass
 
+
+@configclass
+class RslRlValidatedBilevelLirpgPpoAlgorithmCfg(RslRlVelocityEstimatorPpoAlgorithmCfg):
+    """Validated bilevel LIRPG algorithm cfg for V21o."""
+
+    class_name: str = (
+        "unitree_rl_lab.utils.validated_lirpg_ppo:ValidatedBilevelLirpgVelocityEstimatorPPO"
+    )
+    lirpg_meta_gamma: float = 0.99
+    lirpg_meta_lam: float = 0.95
+    lirpg_warmup_iters: int = 6000
+    validation_steps: int = 24
+    inner_lr: float = 3.0e-4
+    inner_steps: int = 1
+    inner_max_samples: int = 8192
+    outer_max_samples: int = 8192
+    true_lin_cmd_floor: float = 0.1
+    true_ang_cmd_floor: float = 0.1
+    true_fall_tail_penalty: float = 1.0
+    meta_step_param_l2_coef: float = 1.0e-4
+    meta_grad_clip: float = 1.0
+    strict_actor_update: bool = False
+    update_aux_before_shadow: bool = False
+    true_reward_mode: str = "step"
+    true_pure_wz_lin_abs_weight: float = 1.0
+    true_pure_linear_yaw_abs_weight: float = 1.0
+    true_standing_lin_abs_weight: float = 1.0
+    true_standing_yaw_abs_weight: float = 1.0
+    commit_meta_reward_to_ppo: bool = False
+    require_meta_channels: bool = False
+    log_meta_effectiveness: bool = True
+
+
+@configclass
+class G115DofV21oValidatedLirpgRunnerCfg(G115DofV21eVelocityEstimatorPPORunnerCfg):
+    """V21o: V21l linear LIRPG with validated bilevel meta-updates."""
+
+    class_name: str = "unitree_rl_lab.utils.validated_lirpg_ppo:ValidatedBilevelOnPolicyRunner"
+    max_iterations = 30000
+
+    algorithm = RslRlValidatedBilevelLirpgPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+        lirpg_meta_gamma=0.99,
+        lirpg_meta_lam=0.95,
+        lirpg_warmup_iters=6000,
+        validation_steps=24,
+        inner_lr=3.0e-4,
+        inner_steps=1,
+        inner_max_samples=8192,
+        outer_max_samples=8192,
+        true_lin_cmd_floor=0.1,
+        true_ang_cmd_floor=0.1,
+        true_fall_tail_penalty=1.0,
+        meta_step_param_l2_coef=1.0e-4,
+        meta_grad_clip=1.0,
+    )
+
+
+@configclass
+class G115DofV21pStrictValidatedLirpgRunnerCfg(G115DofV21eVelocityEstimatorPPORunnerCfg):
+    """V21p: command-conditioned linear LIRPG with strict validated actor update."""
+
+    class_name: str = "unitree_rl_lab.utils.validated_lirpg_ppo:ValidatedBilevelOnPolicyRunner"
+    max_iterations = 30000
+
+    algorithm = RslRlValidatedBilevelLirpgPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+        lirpg_meta_gamma=0.99,
+        lirpg_meta_lam=0.95,
+        lirpg_warmup_iters=6000,
+        validation_steps=48,
+        inner_lr=3.0e-4,
+        inner_steps=1,
+        inner_max_samples=8192,
+        outer_max_samples=8192,
+        true_lin_cmd_floor=0.1,
+        true_ang_cmd_floor=0.1,
+        true_fall_tail_penalty=1.0,
+        meta_step_param_l2_coef=1.0e-4,
+        meta_grad_clip=1.0,
+        strict_actor_update=True,
+        update_aux_before_shadow=True,
+        true_reward_mode="trajectory",
+        true_pure_wz_lin_abs_weight=1.0,
+        true_pure_linear_yaw_abs_weight=1.0,
+        true_standing_lin_abs_weight=1.0,
+        true_standing_yaw_abs_weight=1.0,
+    )
+
+
+@configclass
+class G115DofV21qCommittedValidatedLirpgRunnerCfg(G115DofV21eVelocityEstimatorPPORunnerCfg):
+    """V21q: command-conditioned validated LIRPG committed into full PPO."""
+
+    class_name: str = "unitree_rl_lab.utils.validated_lirpg_ppo:ValidatedBilevelOnPolicyRunner"
+    max_iterations = 30000
+
+    algorithm = RslRlValidatedBilevelLirpgPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.01,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        aux_loss_coef=0.0,
+        aux_loss_schedule=None,
+        velocity_aux_coef=1.0,
+        achieved_ang_vel_scale=0.2,
+        velocity_target_indices=[12, 13, 29],
+        velocity_target_scales=[1.0, 1.0, 5.0],
+        lirpg_meta_gamma=0.99,
+        lirpg_meta_lam=0.95,
+        lirpg_warmup_iters=6000,
+        validation_steps=48,
+        inner_lr=3.0e-4,
+        inner_steps=1,
+        inner_max_samples=8192,
+        outer_max_samples=8192,
+        true_lin_cmd_floor=0.1,
+        true_ang_cmd_floor=0.1,
+        true_fall_tail_penalty=1.0,
+        meta_step_param_l2_coef=1.0e-4,
+        meta_grad_clip=1.0,
+        strict_actor_update=False,
+        update_aux_before_shadow=False,
+        true_reward_mode="trajectory",
+        true_pure_wz_lin_abs_weight=1.0,
+        true_pure_linear_yaw_abs_weight=1.0,
+        true_standing_lin_abs_weight=1.0,
+        true_standing_yaw_abs_weight=1.0,
+        commit_meta_reward_to_ppo=True,
+        require_meta_channels=True,
+        log_meta_effectiveness=True,
+    )
+
 # ---- V22b: V22a + metric-residual CIC intrinsic + SMERL gate ----
 @configclass
 class RslRlSegmentEncoderCICPpoAlgorithmCfg(RslRlSegmentEncoderPpoAlgorithmCfg):

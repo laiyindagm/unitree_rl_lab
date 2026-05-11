@@ -36,12 +36,31 @@ import torch.nn.functional as F
 
 
 _REGISTRY: dict[str, "IntrinsicRewardChannel"] = {}
+_RECORDING_ENABLED = True
+
+
+def set_recording_enabled(enabled: bool) -> None:
+    """Enable/disable rollout-buffer recording inside reward evaluation.
+
+    Validation rollouts for bilevel reward learning still need the environment
+    reward to be computed, but must not pollute the just-collected train
+    rollout buffers used for the differentiable inner update.
+    """
+
+    global _RECORDING_ENABLED
+    _RECORDING_ENABLED = bool(enabled)
 
 
 def get_or_create(name: str, **kwargs) -> "IntrinsicRewardChannel":
     if name not in _REGISTRY:
         _REGISTRY[name] = IntrinsicRewardChannel(name=name, **kwargs)
     return _REGISTRY[name]
+
+
+def get_or_create_command(name: str, **kwargs) -> "CommandConditionedIntrinsicRewardChannel":
+    if name not in _REGISTRY:
+        _REGISTRY[name] = CommandConditionedIntrinsicRewardChannel(name=name, **kwargs)
+    return _REGISTRY[name]  # type: ignore[return-value]
 
 
 def get(name: str) -> "IntrinsicRewardChannel | None":
@@ -125,7 +144,11 @@ class IntrinsicRewardChannel(nn.Module):
 
         self._features_list: list[torch.Tensor] = []
         self._task_err_list: list[torch.Tensor] = []
+        self._reward_list: list[torch.Tensor] = []
         self._dones_list: list[torch.Tensor] = []
+        self._prev_meta_state: dict[str, torch.Tensor] = {
+            k: v.detach().clone() for k, v in self.state_dict().items()
+        }
 
     # ------------------------------------------------------------------ prior
 
@@ -185,8 +208,10 @@ class IntrinsicRewardChannel(nn.Module):
         r = _leaky(raw, self.slope_neg)
 
         # Clone to plain (non-inference) tensors for the meta-update buffer.
-        self._features_list.append(feats.detach().clone())
-        self._task_err_list.append(err.detach().clone())
+        if _RECORDING_ENABLED:
+            self._features_list.append(feats.detach().clone())
+            self._task_err_list.append(err.detach().clone())
+            self._reward_list.append(r.detach().clone())
         return r
 
     def record_dones(self, dones: torch.Tensor) -> None:
@@ -199,7 +224,102 @@ class IntrinsicRewardChannel(nn.Module):
     def clear_buffer(self) -> None:
         self._features_list.clear()
         self._task_err_list.clear()
+        self._reward_list.clear()
         self._dones_list.clear()
+
+    def stacked_buffer(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return train rollout tensors as (features, err, reward, dones)."""
+        T = len(self._features_list)
+        if T == 0:
+            raise RuntimeError(f"IntrinsicRewardChannel '{self.name}' has an empty rollout buffer.")
+        if len(self._task_err_list) < T or len(self._reward_list) < T or len(self._dones_list) < T:
+            raise RuntimeError(
+                f"IntrinsicRewardChannel '{self.name}' has inconsistent buffers: "
+                f"features={len(self._features_list)}, err={len(self._task_err_list)}, "
+                f"reward={len(self._reward_list)}, dones={len(self._dones_list)}."
+            )
+        feats = torch.stack([f.clone() for f in self._features_list[:T]], dim=0)
+        task_err = torch.stack([e.clone() for e in self._task_err_list[:T]], dim=0)
+        rewards = torch.stack([r.clone() for r in self._reward_list[:T]], dim=0)
+        dones = torch.stack([d.clone() for d in self._dones_list[:T]], dim=0)
+        return feats, task_err, rewards, dones
+
+    def differentiable_reward_from_buffer(
+        self,
+        feats: torch.Tensor | None = None,
+        task_err: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Recompute V21l linear reward on buffered rollout with gradients."""
+        if feats is None or task_err is None:
+            feats, task_err, _, _ = self.stacked_buffer()
+        T = feats.shape[0]
+        flat_feats = feats.view(-1, self.feature_dim)
+        flat_err = task_err.view(-1).detach()
+
+        f_phi_flat = F.softplus(self.net(flat_feats)).squeeze(-1).clamp(max=self.f_phi_max)
+        raw_flat = 1.0 - flat_err * f_phi_flat
+        r_phi_flat = torch.where(raw_flat >= 0, raw_flat, self.slope_neg * raw_flat)
+        r_phi_flat = r_phi_flat.clamp(max=1.0)
+        logs = {
+            "r_phi_mean": r_phi_flat.mean(),
+            "f_phi_mean": f_phi_flat.mean(),
+            "f_phi_min": f_phi_flat.min(),
+            "f_phi_max": f_phi_flat.max(),
+        }
+        return r_phi_flat.view(T, -1), logs
+
+    def regularization_loss(
+        self,
+        feats: torch.Tensor | None = None,
+        task_err: torch.Tensor | None = None,
+        step_param_l2_coef: float = 0.0,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return prior, monotonicity, and optional per-step trust-region losses."""
+        if feats is None or task_err is None:
+            feats, task_err, _, _ = self.stacked_buffer()
+        flat_feats = feats.view(-1, self.feature_dim)
+        flat_err = task_err.view(-1).detach()
+        device = flat_feats.device
+
+        prior_loss = torch.tensor(0.0, device=device)
+        if self.prior_weight > 0.0 and self.prior_param_l2_coef > 0.0:
+            for k, p in self.named_parameters():
+                p0 = self._prior_state[k].to(p.device)
+                prior_loss = prior_loss + (p - p0).pow(2).sum()
+            prior_loss = self.prior_weight * self.prior_param_l2_coef * prior_loss
+
+        mono_loss = torch.tensor(0.0, device=device)
+        if self.mono_coef > 0.0:
+            flat_v = flat_feats[:, : self.err_dim].detach().clone().requires_grad_(True)
+            flat_vc = flat_feats[:, self.err_dim :].detach()
+            f_phi_m = F.softplus(self.net(torch.cat([flat_v, flat_vc], dim=-1))).squeeze(-1).clamp(
+                max=self.f_phi_max
+            )
+            grad_v = torch.autograd.grad(f_phi_m.sum(), flat_v, create_graph=True)[0]
+            e_safe = flat_err.clamp(min=1e-6)
+            e_hat = (flat_v.detach() - flat_vc) / e_safe.unsqueeze(-1)
+            df_de = (grad_v * e_hat).sum(dim=-1)
+            violation = F.relu(-(f_phi_m + flat_err * df_de))
+            active = (flat_err > 1e-3).float()
+            mono_loss = self.mono_coef * (violation.pow(2) * active).mean()
+
+        step_loss = torch.tensor(0.0, device=device)
+        if step_param_l2_coef > 0.0:
+            for k, p in self.named_parameters():
+                p_old = self._prev_meta_state[k].to(p.device)
+                step_loss = step_loss + (p - p_old).pow(2).sum()
+            step_loss = float(step_param_l2_coef) * step_loss
+
+        total = prior_loss + mono_loss + step_loss
+        logs = {
+            "prior_loss": prior_loss.detach(),
+            "mono_loss": mono_loss.detach(),
+            "step_loss": step_loss.detach(),
+        }
+        return total, logs
+
+    def snapshot_meta_state(self) -> None:
+        self._prev_meta_state = {k: v.detach().clone() for k, v in self.state_dict().items()}
 
     # --------------------------------------------------------------- meta-step
 
@@ -291,6 +411,57 @@ class IntrinsicRewardChannel(nn.Module):
 
         self.clear_buffer()
         return result
+
+
+class CommandConditionedIntrinsicRewardChannel(IntrinsicRewardChannel):
+    """Learnable-slope reward whose slope depends only on command/mode features.
+
+    Reward shape is still V21l's linear form:
+
+        r = leaky(1 - e * f_phi(command, mode))
+
+    Since f_phi is positive and independent of the actual velocity, monotonicity
+    in the tracking error e is guaranteed by construction.
+    """
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        v: torch.Tensor,
+        v_cmd: torch.Tensor,
+        slope_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass for env reward term. No grad. Records (condition, err)."""
+        if v.dim() == 1:
+            v = v.unsqueeze(-1)
+        if v_cmd.dim() == 1:
+            v_cmd = v_cmd.unsqueeze(-1)
+        if slope_features.shape[-1] != self.feature_dim:
+            raise ValueError(
+                f"CommandConditionedIntrinsicRewardChannel '{self.name}' expected "
+                f"{self.feature_dim} feature dims, got {slope_features.shape[-1]}."
+            )
+
+        if self.err_dim > 1:
+            err = (v - v_cmd).norm(dim=-1)
+        else:
+            err = (v - v_cmd).abs().squeeze(-1)
+
+        f_phi = F.softplus(self.net(slope_features)).squeeze(-1).clamp(max=self.f_phi_max)
+        raw = 1.0 - err * f_phi
+        r = _leaky(raw, self.slope_neg)
+
+        if _RECORDING_ENABLED:
+            self._features_list.append(slope_features.detach().clone())
+            self._task_err_list.append(err.detach().clone())
+            self._reward_list.append(r.detach().clone())
+        return r
+
+    def meta_update(self, gamma: float = 0.99, lam: float = 0.95) -> dict[str, float]:  # noqa: ARG002
+        raise RuntimeError(
+            "CommandConditionedIntrinsicRewardChannel must be trained through "
+            "validated bilevel updates, not current-rollout LIRPG correlation."
+        )
 
 
 def get_or_create_gauss(name: str, **kwargs) -> "GaussianIntrinsicRewardChannel":

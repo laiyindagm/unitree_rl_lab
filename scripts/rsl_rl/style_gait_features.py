@@ -19,6 +19,7 @@ import argparse
 import glob
 import json
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -445,6 +446,7 @@ def main():
     ap.add_argument("--out_shard_size", type=int, default=2048)
     ap.add_argument("--dt", type=float, default=0.02)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--save_compression", choices=["compressed", "stored"], default="compressed")
     ap.add_argument("--max_input_shards", type=int, default=None)
     ap.add_argument("--max_parents", type=int, default=None)
     args = ap.parse_args()
@@ -496,6 +498,12 @@ def main():
     shard_idx = 0
     n_samples = 0
     parent_id = 0
+    sample_counts_by_bucket: dict[str, int] = defaultdict(int)
+    sample_counts_by_mode: dict[str, int] = defaultdict(int)
+    sample_counts_by_source: dict[str, int] = defaultdict(int)
+    sample_counts_by_source_bucket: dict[str, int] = defaultdict(int)
+    parent_counts_by_bucket: dict[str, int] = defaultdict(int)
+    parent_counts_by_source: dict[str, int] = defaultdict(int)
 
     def flush():
         nonlocal shard_idx
@@ -505,7 +513,10 @@ def main():
         for k, v in buf.items():
             out[k] = np.stack(v, axis=0)
         path = os.path.join(args.out_dir, f"style_shard_{shard_idx:05d}.npz")
-        np.savez_compressed(path, **out)
+        if args.save_compression == "stored":
+            np.savez(path, **out)
+        else:
+            np.savez_compressed(path, **out)
         print(f"[style-features] wrote {path} ({out['cmd'].shape[0]} samples)", flush=True)
         shard_idx += 1
         for k in buf:
@@ -528,6 +539,8 @@ def main():
                 cmd_seg = np.mean(parent_cmd, axis=0).astype(np.float32)
                 mode_id = int(mode_id_from_cmd(cmd_seg[None, :])[0])
                 bucket_id = bucket_id_from_cmd(cmd_seg)
+                parent_counts_by_bucket[str(bucket_id)] += 1
+                parent_counts_by_source[str(source_id)] += 1
 
                 y0_stats.update(y0, y0_valid)
 
@@ -567,6 +580,10 @@ def main():
                     buf["source_id"].append(np.asarray(source_id, dtype=np.int64))
                     buf["parent_id"].append(np.asarray(parent_id, dtype=np.int64))
                     n_samples += 1
+                    sample_counts_by_bucket[str(bucket_id)] += 1
+                    sample_counts_by_mode[str(mode_id)] += 1
+                    sample_counts_by_source[str(source_id)] += 1
+                    sample_counts_by_source_bucket[f"{source_id}:{bucket_id}"] += 1
                     if len(buf["cmd"]) >= args.out_shard_size:
                         flush()
                 parent_id += 1
@@ -591,8 +608,11 @@ def main():
         },
         "input_paths": input_paths,
         "n_samples": int(n_samples),
+        "n_parents": int(parent_id),
         "parent_len": args.parent_len,
         "window_len": args.window_len,
+        "parent_stride": args.parent_stride,
+        "samples_per_parent": args.samples_per_parent,
         "dt": args.dt,
         "y0_names": y0_names,
         "y0_mean": y0_mean.tolist(),
@@ -603,6 +623,12 @@ def main():
         "yphi_std": yphi_std.tolist(),
         "yphi_count": yphi_count.tolist(),
         "bucket_names": ["standing", "pure_wz", "low_xy", "mid_xy", "high_xy", "mixed"],
+        "sample_counts_by_bucket": dict(sorted(sample_counts_by_bucket.items())),
+        "sample_counts_by_mode": dict(sorted(sample_counts_by_mode.items())),
+        "sample_counts_by_source": dict(sorted(sample_counts_by_source.items())),
+        "sample_counts_by_source_bucket": dict(sorted(sample_counts_by_source_bucket.items())),
+        "parent_counts_by_bucket": dict(sorted(parent_counts_by_bucket.items())),
+        "parent_counts_by_source": dict(sorted(parent_counts_by_source.items())),
     }
     with open(os.path.join(args.out_dir, "feature_stats.json"), "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)

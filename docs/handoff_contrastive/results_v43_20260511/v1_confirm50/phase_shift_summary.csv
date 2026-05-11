@@ -1,0 +1,7 @@
+name,preset,seed,probe_json,R2_phase_from_Z,R2_phase_mlp_from_Z,phase_shift_ratio,phase_shift_same_parent_dist,phase_shift_same_bucket_dist,phase_shift_n_parent_groups
+C1_stats_tcn_50_s0,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C1_stats_tcn_50_s0/probe.json,0.07773494720458984,0.024376235902309418,,,,
+C1_stats_tcn_50_s1,E4_full,1,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C1_stats_tcn_50_s1/probe.json,0.07623852044343948,0.011278323829174042,,,,
+C1_stats_tcn_50_s2,E4_full,2,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C1_stats_tcn_50_s2/probe.json,0.07679486274719238,0.0559786856174469,,,,
+C2_stats_tcn_dual_50_s0,E4_full,0,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C2_stats_tcn_dual_50_s0/probe.json,0.06183923780918121,-0.008890621364116669,,,,
+C2_stats_tcn_dual_50_s1,E4_full,1,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C2_stats_tcn_dual_50_s1/probe.json,0.06093991547822952,-0.009132571518421173,,,,
+C2_stats_tcn_dual_50_s2,E4_full,2,logs/frnc_style_v43_plan_20260510_234247/confirm50_v1/C2_stats_tcn_dual_50_s2/probe.json,0.05583161860704422,-0.009398505091667175,,,,

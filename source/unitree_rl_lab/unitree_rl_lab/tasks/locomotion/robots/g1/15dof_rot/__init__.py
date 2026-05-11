@@ -1253,6 +1253,48 @@ gym.register(
     },
 )
 
+# V21o: V21l's linear learnable tracking reward + monotonicity constraint,
+# but with validated bilevel meta-updates after a differentiable shadow PPO
+# actor update. Does not use the V21m Gaussian sigma reward.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21o",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21o:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21o:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21oValidatedLirpgRunnerCfg",
+    },
+)
+
+# V21p: V21o's validated bilevel direction, but strict: the actor accepts the
+# validated shadow update, the true objective uses trajectory-mean tracking
+# error, and the learnable slope depends only on command/mode.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21p",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21p:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21p:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21pStrictValidatedLirpgRunnerCfg",
+    },
+)
+
+# V21q: V21p command-conditioned reward and trajectory true objective, but
+# theta_prime remains a meta-gradient probe only. The updated reward parameters
+# are committed back to the current rollout before the full PPO update.
+gym.register(
+    id="Unitree-G1-15dof-Velocity-Rot-V21q",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21q:RobotEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.velocity_env_cfg_rot_v21q:RobotPlayEnvCfg",
+        "rsl_rl_cfg_entry_point": "unitree_rl_lab.tasks.locomotion.agents.rsl_rl_ppo_cfg:G115DofV21qCommittedValidatedLirpgRunnerCfg",
+    },
+)
+
 # V22a: V21g env + frozen V3 segment-encoder z_gait injected into the actor's
 # policy latent. The encoder is loaded from
 # /root/workspace/unitree_rl_lab/logs/frnc_seg_v3/v3_full/encoder.pt, kept in

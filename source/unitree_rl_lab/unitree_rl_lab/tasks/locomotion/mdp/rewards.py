@@ -1517,6 +1517,92 @@ def track_ang_vel_z_intrinsic(
     return chan.evaluate(actual_yaw, cmd_yaw)
 
 
+def _velocity_command_mode_features(cmd: torch.Tensor, eps: float = 0.1) -> torch.Tensor:
+    """Return [vx, vy, wz, standing, pure_vx, pure_vy, pure_wz, other]."""
+    vx_zero = cmd[:, 0].abs() < eps
+    vy_zero = cmd[:, 1].abs() < eps
+    wz_zero = cmd[:, 2].abs() < eps
+    standing = vx_zero & vy_zero & wz_zero
+    pure_vx = (~vx_zero) & vy_zero & wz_zero
+    pure_vy = vx_zero & (~vy_zero) & wz_zero
+    pure_wz = vx_zero & vy_zero & (~wz_zero)
+    other = ~(standing | pure_vx | pure_vy | pure_wz)
+
+    mode = torch.zeros(cmd.shape[0], 5, device=cmd.device, dtype=cmd.dtype)
+    mode[:, 0] = standing.to(cmd.dtype)
+    mode[:, 1] = pure_vx.to(cmd.dtype)
+    mode[:, 2] = pure_vy.to(cmd.dtype)
+    mode[:, 3] = pure_wz.to(cmd.dtype)
+    mode[:, 4] = other.to(cmd.dtype)
+    return torch.cat([cmd, mode], dim=-1)
+
+
+def track_lin_vel_xy_intrinsic_cmd(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    meta_lr: float = 1e-4,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """V21p xy-tracking with f_phi(command, mode), monotone in error by construction."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    asset = env.scene[asset_cfg.name]
+    cmd_full = env.command_manager.get_command(command_name)
+    cmd_xy = cmd_full[:, :2]
+    vel = quat_apply_inverse(
+        yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3]
+    )[:, :2]
+    features = _velocity_command_mode_features(cmd_full)
+    chan = ir.get_or_create_command(
+        "lin_xy_cmd",
+        feature_dim=8,
+        err_dim=2,
+        b=LINEAR_REL_B_RATIO * std,
+        slope_neg=slope_neg,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        mono_coef=0.0,
+        device=str(vel.device),
+    )
+    return chan.evaluate(vel, cmd_xy, features)
+
+
+def track_ang_vel_z_intrinsic_cmd(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    std: float,
+    slope_neg: float = LEAKY_SLOPE_NEG_DEFAULT,
+    meta_lr: float = 1e-4,
+    prior_weight: float = 1.0,
+    prior_param_l2_coef: float = 1e-3,
+) -> torch.Tensor:
+    """V21p yaw-tracking with f_phi(command, mode), monotone in error by construction."""
+    from unitree_rl_lab.utils import intrinsic_reward as ir
+
+    cmd_full = env.command_manager.get_command(command_name)
+    cmd_yaw = cmd_full[:, 2]
+    actual_yaw = env.scene["robot"].data.root_ang_vel_b[:, 2]
+    features = _velocity_command_mode_features(cmd_full)
+    chan = ir.get_or_create_command(
+        "ang_z_cmd",
+        feature_dim=8,
+        err_dim=1,
+        b=LINEAR_REL_B_RATIO * std,
+        slope_neg=slope_neg,
+        meta_lr=meta_lr,
+        prior_weight=prior_weight,
+        prior_param_l2_coef=prior_param_l2_coef,
+        mono_coef=0.0,
+        device=str(actual_yaw.device),
+    )
+    return chan.evaluate(actual_yaw, cmd_yaw, features)
+
+
 def track_lin_vel_xy_intrinsic_sigma(
     env: ManagerBasedRLEnv,
     command_name: str,
